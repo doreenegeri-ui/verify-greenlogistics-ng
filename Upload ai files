@@ -1,0 +1,2002 @@
+-- documents.sql - Database schema for Green Transport & Logistics
+
+-- Documents table
+CREATE TABLE documents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reference_number VARCHAR(50) UNIQUE NOT NULL,
+    document_type VARCHAR(100) NOT NULL,
+    client_name VARCHAR(255),
+    issue_date DATE NOT NULL,
+    expiry_date DATE,
+    status VARCHAR(20) DEFAULT 'valid' CHECK(status IN ('valid', 'expired', 'revoked')),
+    revocation_reason TEXT,
+    notes TEXT,
+    qr_code_data TEXT,
+    created_by VARCHAR(100) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    is_deleted BOOLEAN DEFAULT FALSE
+);
+
+-- Verification logs table
+CREATE TABLE verification_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_id INTEGER,
+    reference_number VARCHAR(50) NOT NULL,
+    verification_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    ip_address VARCHAR(45),
+    user_agent TEXT,
+    browser_type VARCHAR(100),
+    device_type VARCHAR(50),
+    verification_status VARCHAR(20),
+    FOREIGN KEY (document_id) REFERENCES documents(id)
+);
+
+-- Admin users table
+CREATE TABLE admin_users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username VARCHAR(100) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    email VARCHAR(255) UNIQUE NOT NULL,
+    full_name VARCHAR(255) NOT NULL,
+    role VARCHAR(50) DEFAULT 'admin',
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_login TIMESTAMP
+);
+
+-- Rate limiting table
+CREATE TABLE rate_limits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    identifier VARCHAR(255) NOT NULL,
+    request_count INTEGER DEFAULT 1,
+    first_request TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_request TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Indexes for performance
+CREATE INDEX idx_documents_reference ON documents(reference_number);
+CREATE INDEX idx_documents_status ON documents(status);
+CREATE INDEX idx_verification_logs_doc_id ON verification_logs(document_id);
+CREATE INDEX idx_verification_logs_time ON verification_logs(verification_time);
+CREATE INDEX idx_rate_limits_identifier ON rate_limits(identifier);
+
+// server/app.js - Main application entry point
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const validator = require('validator');
+const path = require('path');
+const { initDatabase } = require('./utils/database');
+const documentRoutes = require('./routes/documents');
+const adminRoutes = require('./routes/admin');
+const { logVerification } = require('./middleware/logging');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Security middleware
+app.use(helmet({
+    contentSecurityPolicy: {
+        directives: {
+            defaultSrc: ["'self'"],
+            styleSrc: ["'self'", "'unsafe-inline'"],
+            scriptSrc: ["'self'"],
+            imgSrc: ["'self'", 'data:', 'https:']
+        }
+    }
+}));
+
+// CORS configuration
+app.use(cors({
+    origin: process.env.ALLOWED_ORIGINS?.split(',') || ['https://www.greenlogistics-ng.com'],
+    credentials: true
+}));
+
+// Rate limiting - 100 requests per 15 minutes per IP
+const limiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 100,
+    message: 'Too many requests from this IP, please try again later.',
+    standardHeaders: true
+});
+app.use('/api/', limiter);
+
+// Stricter rate limit for verification endpoint
+const verifyLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 30,
+    message: 'Too many verification attempts, please try again later.',
+    keyGenerator: (req) => req.ip + '-verify'
+});
+
+// Body parsing
+app.use(express.json({ limit: '10kb' }));
+app.use(express.urlencoded({ extended: true, limit: '10kb' }));
+
+// Input sanitization middleware
+app.use((req, res, next) => {
+    // Sanitize all string inputs
+    const sanitize = (obj) => {
+        if (typeof obj === 'string') {
+            return validator.escape(obj.trim());
+        }
+        if (Array.isArray(obj)) {
+            return obj.map(sanitize);
+        }
+        if (obj && typeof obj === 'object') {
+            Object.keys(obj).forEach(key => {
+                obj[key] = sanitize(obj[key]);
+            });
+        }
+        return obj;
+    };
+    
+    if (req.body) req.body = sanitize(req.body);
+    if (req.query) req.query = sanitize(req.query);
+    if (req.params) req.params = sanitize(req.params);
+    
+    next();
+});
+
+// Static files
+app.use(express.static(path.join(__dirname, '../public')));
+app.use('/admin', express.static(path.join(__dirname, '../admin')));
+
+// Routes
+app.use('/api/documents', verifyLimiter, logVerification, documentRoutes);
+app.use('/api/admin', adminRoutes);
+
+// Public verification page
+app.get('/verify', (req, res) => {
+    res.sendFile(path.join(__dirname, '../public/verify.html'));
+});
+
+// Verification with reference in URL
+app.get('/verify/:reference', (req, res) => {
+    res.sendFile(path.join(__dirname, '../public/verify.html'));
+});
+
+// Initialize database and start server
+initDatabase()
+    .then(() => {
+        app.listen(PORT, () => {
+            console.log(`Server running on port ${PORT}`);
+            console.log(`Verification page: https://www.greenlogistics-ng.com/verify`);
+            console.log(`Admin dashboard: https://www.greenlogistics-ng.com/admin`);
+        });
+    })
+    .catch(err => {
+        console.error('Database initialization failed:', err);
+        process.exit(1);
+    });
+
+module.exports = app;
+// server/routes/documents.js - Document verification API
+const express = require('express');
+const router = express.Router();
+const db = require('../utils/database');
+const { validateReference } = require('../utils/validators');
+
+// Verify document by reference number
+router.get('/verify/:reference?', async (req, res) => {
+    try {
+        const reference = req.params.reference || req.query.ref;
+        
+        if (!reference) {
+            return res.status(400).json({
+                success: false,
+                message: 'Document reference number required'
+            });
+        }
+        
+        // Validate reference format
+        const validation = validateReference(reference);
+        if (!validation.valid) {
+            return res.status(400).json({
+                success: false,
+                message: validation.message
+            });
+        }
+        
+        // Query database using parameterized query
+        const document = await db.get(`
+            SELECT 
+                id,
+                reference_number,
+                document_type,
+                client_name,
+                issue_date,
+                expiry_date,
+                status,
+                revocation_reason,
+                created_at,
+                last_modified
+            FROM documents
+            WHERE reference_number = ? AND is_deleted = 0
+        `, [reference]);
+        
+        if (!document) {
+            return res.status(404).json({
+                success: false,
+                message: 'Document not found',
+                verified: false
+            });
+        }
+        
+        // Check if expired
+        let status = document.status;
+        if (status === 'valid' && document.expiry_date) {
+            const expiryDate = new Date(document.expiry_date);
+            if (expiryDate < new Date()) {
+                status = 'expired';
+            }
+        }
+        
+        res.json({
+            success: true,
+            verified: true,
+            document: {
+                referenceNumber: document.reference_number,
+                documentType: document.document_type,
+                clientName: document.client_name,
+                issueDate: document.issue_date,
+                expiryDate: document.expiry_date,
+                status: status,
+                revocationReason: document.revocation_reason,
+                qrGeneratedOn: document.created_at,
+                lastUpdated: document.last_modified,
+                issuedBy: 'Green Transport & Logistics'
+            }
+        });
+        
+    } catch (error) {
+        console.error('Verification error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Verification service temporarily unavailable'
+        });
+    }
+});
+
+// Get document analytics (admin only)
+router.get('/analytics', async (req, res) => {
+    try {
+        const [
+            totalDocuments,
+            totalVerifications,
+            invalidAttempts,
+            recentVerifications
+        ] = await Promise.all([
+            db.get(`SELECT COUNT(*) as count FROM documents WHERE is_deleted = 0`),
+            db.get(`SELECT COUNT(*) as count FROM verification_logs`),
+            db.get(`SELECT COUNT(*) as count FROM verification_logs WHERE verification_status = 'not_found'`),
+            db.all(`
+                SELECT 
+                    vl.reference_number,
+                    vl.verification_time,
+                    vl.verification_status,
+                    d.document_type
+                FROM verification_logs vl
+                LEFT JOIN documents d ON vl.document_id = d.id
+                ORDER BY vl.verification_time DESC
+                LIMIT 50
+            `)
+        ]);
+        
+        res.json({
+            success: true,
+            analytics: {
+                totalDocuments: totalDocuments.count,
+                totalVerifications: totalVerifications.count,
+                invalidAttempts: invalidAttempts.count,
+                recentVerifications: recentVerifications
+            }
+        });
+        
+    } catch (error) {
+        console.error('Analytics error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to retrieve analytics'
+        });
+    }
+});
+
+module.exports = router;
+
+<!-- public/verify.html - Public verification page -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Verify the authenticity of Green Transport & Logistics documents">
+    <title>Document Verification | Green Transport & Logistics</title>
+    <link rel="stylesheet" href="css/verify.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="header">
+            <div class="logo">
+                <img src="images/logo.png" alt="Green Transport & Logistics Logo" onerror="this.style.display='none'">
+                <h1>Green Transport & Logistics</h1>
+            </div>
+            <h2>Document Verification</h2>
+            <p class="subtitle">Verify the authenticity of any official Green Transport & Logistics document</p>
+        </header>
+
+        <!-- Search Section -->
+        <section class="search-section">
+            <div class="search-box">
+                <label for="referenceInput">Enter Document Reference Number</label>
+                <input 
+                    type="text" 
+                    id="referenceInput" 
+                    placeholder="Example: GTL-QT-2026-00125"
+                    maxlength="50"
+                    autocomplete="off"
+                >
+                <button id="verifyBtn" class="verify-btn">
+                    <span class="btn-text">Verify Document</span>
+                    <span class="btn-loader" style="display:none;">Verifying...</span>
+                </button>
+            </div>
+        </section>
+
+        <!-- Results Section -->
+        <section id="resultsSection" class="results-section" style="display:none;">
+            <!-- Verified Result -->
+            <div id="verifiedCard" class="result-card verified" style="display:none;">
+                <div class="status-icon">✅</div>
+                <h3 class="status-title">VERIFIED</h3>
+                <div class="details-grid">
+                    <div class="detail-item">
+                        <span class="label">Document Type:</span>
+                        <span class="value" id="docType"></span>
+                    </div>
+                    <div class="detail-item">
+                        <span class="label">Reference Number:</span>
+                        <span class="value" id="docRef"></span>
+                    </div>
+                    <div class="detail-item">
+                        <span class="label">Issue Date:</span>
+                        <span class="value" id="docIssue"></span>
+                    </div>
+                    <div class="detail-item">
+                        <span class="label">Expiry Date:</span>
+                        <span class="value" id="docExpiry"></span>
+                    </div>
+                    <div class="detail-item">
+                        <span class="label">Issued By:</span>
+                        <span class="value" id="docIssuedBy"></span>
+                    </div>
+                    <div class="detail-item">
+                        <span class="label">Client Name:</span>
+                        <span class="value" id="docClient"></span>
+                    </div>
+                    <div class="detail-item">
+                        <span class="label">Status:</span>
+                        <span class="value status-badge" id="docStatus"></span>
+                    </div>
+                    <div class="detail-item">
+                        <span class="label">QR Generated On:</span>
+                        <span class="value" id="docQrDate"></span>
+                    </div>
+                    <div class="detail-item">
+                        <span class="label">Last Updated:</span>
+                        <span class="value" id="docUpdated"></span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Revoked Result -->
+            <div id="revokedCard" class="result-card revoked" style="display:none;">
+                <div class="status-icon">⚠️</div>
+                <h3 class="status-title">Document Revoked</h3>
+                <p class="revocation-reason" id="revocationReason"></p>
+                <p class="contact-info">
+                    This document has been invalidated. For more information, please contact Green Transport & Logistics.
+                </p>
+            </div>
+
+            <!-- Invalid Result -->
+            <div id="invalidCard" class="result-card invalid" style="display:none;">
+                <div class="status-icon">❌</div>
+                <h3 class="status-title">INVALID DOCUMENT</h3>
+                <p class="error-message">The document reference could not be found in our records.</p>
+                <p class="contact-info">
+                    If you believe this is an error, please contact Green Transport & Logistics:
+                </p>
+                <div class="contact-details">
+                    <p>📞 +234-XXX-XXX-XXXX</p>
+                    <p>📧 info@greenlogistics-ng.com</p>
+                </div>
+                <button class="contact-btn" onclick="window.location.href='mailto:info@greenlogistics-ng.com'">
+                    Contact Us
+                </button>
+            </div>
+
+            <!-- Error Result -->
+            <div id="errorCard" class="result-card error" style="display:none;">
+                <div class="status-icon">⚠️</div>
+                <h3 class="status-title">Verification Error</h3>
+                <p class="error-message" id="errorMessage"></p>
+                <button class="retry-btn" onclick="resetSearch()">Try Again</button>
+            </div>
+        </section>
+
+        <!-- Footer -->
+        <footer class="footer">
+            <p>&copy; 2026 Green Transport & Logistics. All rights reserved.</p>
+            <p class="security-note">🔒 Secure verification powered by encrypted document authentication</p>
+        </footer>
+    </div>
+
+    <script src="js/verify.js"></script>
+</body>
+</html>
+
+/* public/css/verify.css - Styling for verification page */
+:root {
+    --primary-green: #2E7D32;
+    --dark-green: #1B5E20;
+    --light-green: #4CAF50;
+    --success-green: #66BB6A;
+    --error-red: #D32F2F;
+    --warning-orange: #F57C00;
+    --text-dark: #212121;
+    --text-light: #757575;
+    --bg-light: #F5F5F5;
+    --white: #FFFFFF;
+    --shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+    --shadow-lg: 0 10px 20px rgba(0, 0, 0, 0.15);
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    background: linear-gradient(135deg, #E8F5E9 0%, #C8E6C9 100%);
+    min-height: 100vh;
+    color: var(--text-dark);
+    line-height: 1.6;
+}
+
+.container {
+    max-width: 800px;
+    margin: 0 auto;
+    padding: 2rem 1rem;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+}
+
+/* Header */
+.header {
+    text-align: center;
+    margin-bottom: 2rem;
+    padding: 2rem;
+    background: var(--white);
+    border-radius: 12px;
+    box-shadow: var(--shadow);
+}
+
+.logo {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 1rem;
+    margin-bottom: 1rem;
+}
+
+.logo img {
+    height: 60px;
+    width: auto;
+}
+
+.logo h1 {
+    color: var(--primary-green);
+    font-size: 1.8rem;
+    font-weight: 700;
+}
+
+.header h2 {
+    color: var(--dark-green);
+    font-size: 1.5rem;
+    margin-bottom: 0.5rem;
+}
+
+.subtitle {
+    color: var(--text-light);
+    font-size: 1rem;
+}
+
+/* Search Section */
+.search-section {
+    background: var(--white);
+    padding: 2rem;
+    border-radius: 12px;
+    box-shadow: var(--shadow);
+    margin-bottom: 2rem;
+}
+
+.search-box {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+}
+
+.search-box label {
+    font-weight: 600;
+    color: var(--text-dark);
+    font-size: 1rem;
+}
+
+.search-box input {
+    padding: 1rem;
+    border: 2px solid #E0E0E0;
+    border-radius: 8px;
+    font-size: 1rem;
+    transition: all 0.3s ease;
+}
+
+.search-box input:focus {
+    outline: none;
+    border-color: var(--primary-green);
+    box-shadow: 0 0 0 3px rgba(46, 125, 50, 0.1);
+}
+
+.verify-btn {
+    background: var(--primary-green);
+    color: var(--white);
+    border: none;
+    padding: 1rem 2rem;
+    border-radius: 8px;
+    font-size: 1.1rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.3s ease;
+}
+
+.verify-btn:hover {
+    background: var(--dark-green);
+    transform: translateY(-2px);
+    box-shadow: var(--shadow-lg);
+}
+
+.verify-btn:active {
+    transform: translateY(0);
+}
+
+.verify-btn:disabled {
+    background: #9E9E9E;
+    cursor: not-allowed;
+    transform: none;
+}
+
+/* Results Section */
+.results-section {
+    flex: 1;
+}
+
+.result-card {
+    background: var(--white);
+    padding: 2rem;
+    border-radius: 12px;
+    box-shadow: var(--shadow);
+    text-align: center;
+    animation: fadeIn 0.5s ease;
+}
+
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(20px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+.result-card.verified {
+    border-left: 5px solid var(--success-green);
+}
+
+.result-card.revoked {
+    border-left: 5px solid var(--warning-orange);
+}
+
+.result-card.invalid {
+    border-left: 5px solid var(--error-red);
+}
+
+.result-card.error {
+    border-left: 5px solid var(--error-red);
+}
+
+.status-icon {
+    font-size: 4rem;
+    margin-bottom: 1rem;
+}
+
+.status-title {
+    font-size: 1.8rem;
+    font-weight: 700;
+    margin-bottom: 1.5rem;
+    color: var(--dark-green);
+}
+
+.result-card.verified .status-title {
+    color: var(--success-green);
+}
+
+.result-card.revoked .status-title {
+    color: var(--warning-orange);
+}
+
+.result-card.invalid .status-title,
+.result-card.error .status-title {
+    color: var(--error-red);
+}
+
+/* Details Grid */
+.details-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+    gap: 1rem;
+    text-align: left;
+    margin-top: 1.5rem;
+}
+
+.detail-item {
+    padding: 0.75rem;
+    background: var(--bg-light);
+    border-radius: 6px;
+}
+
+.detail-item .label {
+    font-weight: 600;
+    color: var(--text-light);
+    font-size: 0.85rem;
+    display: block;
+    margin-bottom: 0.25rem;
+}
+
+.detail-item .value {
+    color: var(--text-dark);
+    font-size: 1rem;
+    font-weight: 500;
+}
+
+.status-badge {
+    display: inline-block;
+    padding: 0.25rem 0.75rem;
+    border-radius: 20px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    text-transform: uppercase;
+}
+
+.status-badge.valid {
+    background: #E8F5E9;
+    color: var(--success-green);
+}
+
+.status-badge.expired {
+    background: #FFF3E0;
+    color: var(--warning-orange);
+}
+
+.status-badge.revoked {
+    background: #FFEBEE;
+    color: var(--error-red);
+}
+
+/* Contact Info */
+.contact-info {
+    color: var(--text-light);
+    margin: 1rem 0;
+    font-size: 0.95rem;
+}
+
+.contact-details {
+    background: var(--bg-light);
+    padding: 1rem;
+    border-radius: 8px;
+    margin: 1.5rem 0;
+}
+
+.contact-details p {
+    margin: 0.5rem 0;
+    color: var(--text-dark);
+}
+
+.contact-btn,
+.retry-btn {
+    background: var(--primary-green);
+    color: var(--white);
+    border: none;
+    padding: 0.75rem 2rem;
+    border-radius: 8px;
+    font-size: 1rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.3s ease;
+    margin-top: 1rem;
+}
+
+.contact-btn:hover,
+.retry-btn:hover {
+    background: var(--dark-green);
+    transform: translateY(-2px);
+}
+
+.revocation-reason {
+    background: #FFF3E0;
+    padding: 1rem;
+    border-radius: 8px;
+    color: var(--warning-orange);
+    font-weight: 500;
+    margin: 1rem 0;
+}
+
+.error-message {
+    color: var(--text-light);
+    margin: 1rem 0;
+}
+
+/* Footer */
+.footer {
+    text-align: center;
+    padding: 2rem;
+    margin-top: 2rem;
+    color: var(--text-light);
+    font-size: 0.9rem;
+}
+
+.security-note {
+    margin-top: 0.5rem;
+    font-size: 0.85rem;
+    color: var(--primary-green);
+}
+
+/* Mobile Responsive */
+@media (max-width: 600px) {
+    .container {
+        padding: 1rem 0.5rem;
+    }
+    
+    .header {
+        padding: 1.5rem 1rem;
+    }
+    
+    .logo h1 {
+        font-size: 1.4rem;
+    }
+    
+    .header h2 {
+        font-size: 1.3rem;
+    }
+    
+    .search-section {
+        padding: 1.5rem 1rem;
+    }
+    
+    .result-card {
+        padding: 1.5rem 1rem;
+    }
+    
+    .details-grid {
+        grid-template-columns: 1fr;
+    }
+    
+    .status-icon {
+        font-size: 3rem;
+    }
+    
+    .status-title {
+        font-size: 1.5rem;
+    }
+}
+
+/* Loading Animation */
+.btn-loader {
+    display: inline-block;
+    animation: pulse 1.5s infinite;
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+}
+
+/* Accessibility */
+@media (prefers-reduced-motion: reduce) {
+    * {
+        animation: none !important;
+        transition: none !important;
+    }
+}
+
+/* Focus States */
+input:focus,
+button:focus {
+    outline: 3px solid var(--primary-green);
+    outline-offset: 2px;
+}
+
+/* High Contrast Mode */
+@media (prefers-contrast: high) {
+    :root {
+        --primary-green: #006400;
+        --dark-green: #004D00;
+        --success-green: #008000;
+    }
+    
+    .result-card {
+        border: 3px solid var(--text-dark);
+    }
+}
+// public/js/verify.js - Client-side verification logic
+document.addEventListener('DOMContentLoaded', function() {
+    const referenceInput = document.getElementById('referenceInput');
+    const verifyBtn = document.getElementById('verifyBtn');
+    const resultsSection = document.getElementById('resultsSection');
+    const btnText = verifyBtn.querySelector('.btn-text');
+    const btnLoader = verifyBtn.querySelector('.btn-loader');
+    
+    // Check URL for reference parameter
+    checkUrlForReference();
+    
+    // Verify button click handler
+    verifyBtn.addEventListener('click', verifyDocument);
+    
+    // Enter key handler
+    referenceInput.addEventListener('keypress', function(e) {
+        if (e.key === 'Enter') {
+            verifyDocument();
+        }
+    });
+    
+    // Input validation - only allow alphanumeric and hyphens
+    referenceInput.addEventListener('input', function(e) {
+        const value = e.target.value;
+        const sanitized = value.replace(/[^a-zA-Z0-9-]/g, '');
+        if (value !== sanitized) {
+            e.target.value = sanitized;
+        }
+    });
+    
+    function checkUrlForReference() {
+        const path = window.location.pathname;
+        const urlParams = new URLSearchParams(window.location.search);
+        
+        // Check path format: /verify/GTL-QT-2026-00125
+        const pathParts = path.split('/');
+        if (pathParts.length >= 3 && pathParts[2]) {
+            const refFromPath = decodeURIComponent(pathParts[2]);
+            if (isValidReferenceFormat(refFromPath)) {
+                referenceInput.value = refFromPath;
+                verifyDocument();
+                return;
+            }
+        }
+        
+        // Check query parameter: /verify?ref=GTL-QT-2026-00125
+        const refFromQuery = urlParams.get('ref');
+        if (refFromQuery && isValidReferenceFormat(refFromQuery)) {
+            referenceInput.value = refFromQuery;
+            verifyDocument();
+            return;
+        }
+    }
+    
+    function isValidReferenceFormat(ref) {
+        // Basic validation: GTL-XX-YYYY-NNNNN format
+        const pattern = /^GTL-[A-Z]{2}-\d{4}-\d{5,}$/i;
+        return pattern.test(ref);
+    }
+    
+    async function verifyDocument() {
+        const reference = referenceInput.value.trim();
+        
+        if (!reference) {
+            showError('Please enter a document reference number');
+            return;
+        }
+        
+        // Basic format validation
+        if (!isValidReferenceFormat(reference)) {
+            showError('Invalid reference format. Expected: GTL-XX-YYYY-NNNNN');
+            return;
+        }
+        
+        // Disable button and show loading
+        setLoading(true);
+        hideResults();
+        
+        try {
+            const response = await fetch(`/api/documents/verify/${encodeURIComponent(reference)}`, {
+                method: 'GET',
+                headers: {
+                    'Content-Type': 'application/json'
+                }
+            });
+            
+            const data = await response.json();
+            
+            if (!data.success) {
+                if (response.status === 404) {
+                    showInvalid();
+                } else {
+                    showError(data.message || 'Verification failed');
+                }
+                return;
+            }
+            
+            displayVerificationResult(data.document);
+            
+        } catch (error) {
+            console.error('Verification error:', error);
+            showError('Network error. Please check your connection and try again.');
+        } finally {
+            setLoading(false);
+        }
+    }
+    
+    function displayVerificationResult(doc) {
+        hideResults();
+        
+        if (doc.status === 'revoked') {
+            showRevoked(doc.revocationReason);
+            return;
+        }
+        
+        // Populate verified card
+        document.getElementById('docType').textContent = doc.documentType;
+        document.getElementById('docRef').textContent = doc.referenceNumber;
+        document.getElementById('docIssue').textContent = formatDate(doc.issueDate);
+        document.getElementById('docExpiry').textContent = doc.expiryDate ? formatDate(doc.expiryDate) : 'N/A';
+        document.getElementById('docIssuedBy').textContent = doc.issuedBy;
+        document.getElementById('docClient').textContent = doc.clientName || 'Confidential';
+        
+        const statusElement = document.getElementById('docStatus');
+        statusElement.textContent = doc.status;
+        statusElement.className = 'status-badge ' + doc.status;
+        
+        document.getElementById('docQrDate').textContent = formatDate(doc.qrGeneratedOn);
+        document.getElementById('docUpdated').textContent = formatDate(doc.lastUpdated);
+        
+        document.getElementById('verifiedCard').style.display = 'block';
+        resultsSection.style.display = 'block';
+    }
+    
+    function showInvalid() {
+        hideResults();
+        document.getElementById('invalidCard').style.display = 'block';
+        resultsSection.style.display = 'block';
+    }
+    
+    function showRevoked(reason) {
+        hideResults();
+        document.getElementById('revocationReason').textContent = reason || 'No reason provided';
+        document.getElementById('revokedCard').style.display = 'block';
+        resultsSection.style.display = 'block';
+    }
+    
+    function showError(message) {
+        hideResults();
+        document.getElementById('errorMessage').textContent = message;
+        document.getElementById('errorCard').style.display = 'block';
+        resultsSection.style.display = 'block';
+    }
+    
+    function hideResults() {
+        resultsSection.style.display = 'none';
+        document.getElementById('verifiedCard').style.display = 'none';
+        document.getElementById('revokedCard').style.display = 'none';
+        document.getElementById('invalidCard').style.display = 'none';
+        document.getElementById('errorCard').style.display = 'none';
+    }
+    
+    function setLoading(loading) {
+        verifyBtn.disabled = loading;
+        btnText.style.display = loading ? 'none' : 'inline';
+        btnLoader.style.display = loading ? 'inline' : 'none';
+    }
+    
+    function formatDate(dateString) {
+        if (!dateString) return 'N/A';
+        const date = new Date(dateString);
+        return date.toLocaleDateString('en-NG', {
+            year: 'numeric',
+            month: 'long',
+            day: 'numeric'
+        });
+    }
+    
+    // Expose reset function globally
+    window.resetSearch = function() {
+        referenceInput.value = '';
+        hideResults();
+        referenceInput.focus();
+    };
+});
+
+<!-- admin/index.html - Admin dashboard -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin Dashboard | Green Transport & Logistics</title>
+    <link rel="stylesheet" href="css/admin.css">
+</head>
+<body>
+    <!-- Login Page -->
+    <div id="loginPage" class="login-container">
+        <div class="login-box">
+            <div class="logo">
+                <img src="../images/logo.png" alt="Logo" onerror="this.style.display='none'">
+                <h1>Admin Dashboard</h1>
+            </div>
+            <form id="loginForm">
+                <div class="form-group">
+                    <label for="username">Username</label>
+                    <input type="text" id="username" required autocomplete="username">
+                </div>
+                <div class="form-group">
+                    <label for="password">Password</label>
+                    <input type="password" id="password" required autocomplete="current-password">
+                </div>
+                <button type="submit" class="login-btn">Login</button>
+                <p id="loginError" class="error-message" style="display:none;"></p>
+            </form>
+        </div>
+    </div>
+
+    <!-- Main Dashboard -->
+    <div id="dashboardPage" class="dashboard-container" style="display:none;">
+        <!-- Sidebar -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <h2>Green Transport</h2>
+                <p>Admin Dashboard</p>
+            </div>
+            <nav class="sidebar-nav">
+                <a href="#" class="nav-item active" data-page="overview">
+                    <span class="nav-icon">📊</span>
+                    Overview
+                </a>
+                <a href="#" class="nav-item" data-page="documents">
+                    <span class="nav-icon">📄</span>
+                    Documents
+                </a>
+                <a href="#" class="nav-item" data-page="add">
+                    <span class="nav-icon">➕</span>
+                    Add Document
+                </a>
+                <a href="#" class="nav-item" data-page="history">
+                    <span class="nav-icon">📜</span>
+                    Verification History
+                </a>
+            </nav>
+            <div class="sidebar-footer">
+                <div class="user-info">
+                    <span id="userFullName">Admin User</span>
+                    <span id="userRole" class="role-badge">Admin</span>
+                </div>
+                <button id="logoutBtn" class="logout-btn">Logout</button>
+            </div>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Overview Page -->
+            <div id="overviewPage" class="page active">
+                <header class="page-header">
+                    <h1>Dashboard Overview</h1>
+                </header>
+                
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-icon">📄</div>
+                        <div class="stat-info">
+                            <h3 id="totalDocuments">0</h3>
+                            <p>Total Documents</p>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon">✅</div>
+                        <div class="stat-info">
+                            <h3 id="totalVerifications">0</h3>
+                            <p>Total Verifications</p>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon">❌</div>
+                        <div class="stat-info">
+                            <h3 id="invalidAttempts">0</h3>
+                            <p>Invalid Attempts</p>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon">📈</div>
+                        <div class="stat-info">
+                            <h3 id="successRate">0%</h3>
+                            <p>Success Rate</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="recent-verifications">
+                    <h2>Recent Verifications</h2>
+                    <div class="table-container">
+                        <table id="recentTable">
+                            <thead>
+                                <tr>
+                                    <th>Reference</th>
+                                    <th>Type</th>
+                                    <th>Status</th>
+                                    <th>Time</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <!-- Dynamic content -->
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Documents Page -->
+            <div id="documentsPage" class="page">
+                <header class="page-header">
+                    <h1>Manage Documents</h1>
+                    <button class="add-btn" onclick="showPage('add')">+ Add Document</button>
+                </header>
+                
+                <div class="filters">
+                    <input type="text" id="searchInput" placeholder="Search documents..." class="search-input">
+                    <select id="statusFilter" class="filter-select">
+                        <option value="">All Statuses</option>
+                        <option value="valid">Valid</option>
+                        <option value="expired">Expired</option>
+                        <option value="revoked">Revoked</option>
+                    </select>
+                </div>
+
+                <div class="table-container">
+                    <table id="documentsTable">
+                        <thead>
+                            <tr>
+                                <th>Reference</th>
+                                <th>Type</th>
+                                <th>Client</th>
+                                <th>Issue Date</th>
+                                <th>Status</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <!-- Dynamic content -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Add Document Page -->
+            <div id="addPage" class="page">
+                <header class="page-header">
+                    <h1>Add New Document</h1>
+                </header>
+                
+                <form id="addDocumentForm" class="document-form">
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="refNumber">Reference Number *</label>
+                            <input type="text" id="refNumber" required placeholder="GTL-QT-2026-00125">
+                        </div>
+                        <div class="form-group">
+                            <label for="docType">Document Type *</label>
+                            <select id="docType" required>
+                                <option value="">Select type</option>
+                                <option value="Quotation">Quotation</option>
+                                <option value="Invoice">Invoice</option>
+                                <option value="Delivery Note">Delivery Note</option>
+                                <option value="Contract">Contract</option>
+                                <option value="Certificate">Certificate</option>
+                                <option value="Letter">Letter</option>
+                                <option value="Other">Other</option>
+                            </select>
+                        </div>
+                    </div>
+                    
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="clientName">Client Name</label>
+                            <input type="text" id="clientName" placeholder="Optional">
+                        </div>
+                        <div class="form-group">
+                            <label for="issueDate">Issue Date *</label>
+                            <input type="date" id="issueDate" required>
+                        </div>
+                    </div>
+                    
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="expiryDate">Expiry Date</label>
+                            <input type="date" id="expiryDate">
+                        </div>
+                        <div class="form-group">
+                            <label for="notes">Notes</label>
+                            <input type="text" id="notes" placeholder="Optional notes">
+                        </div>
+                    </div>
+                    
+                    <div class="form-actions">
+                        <button type="submit" class="submit-btn">Create Document</button>
+                        <button type="button" class="cancel-btn" onclick="showPage('documents')">Cancel</button>
+                    </div>
+                </form>
+            </div>
+
+            <!-- History Page -->
+            <div id="historyPage" class="page">
+                <header class="page-header">
+                    <h1>Verification History</h1>
+                </header>
+                
+                <div class="filters">
+                    <input type="text" id="historySearch" placeholder="Search history..." class="search-input">
+                </div>
+
+                <div class="table-container">
+                    <table id="historyTable">
+                        <thead>
+                            <tr>
+                                <th>Reference</th>
+                                <th>Type</th>
+                                <th>Client</th>
+                                <th>Status</th>
+                                <th>IP Address</th>
+                                <th>Browser</th>
+                                <th>Time</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <!-- Dynamic content -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Modal for Edit/Revoke -->
+    <div id="documentModal" class="modal" style="display:none;">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 id="modalTitle">Edit Document</h2>
+                <button class="close-modal" onclick="closeModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <!-- Dynamic content -->
+            </div>
+        </div>
+    </div>
+
+    <script src="js/admin.js"></script>
+</body>
+</html>
+
+/* admin/css/admin.css - Admin dashboard styling */
+:root {
+    --primary-green: #2E7D32;
+    --dark-green: #1B5E20;
+    --light-green: #4CAF50;
+    --sidebar-bg: #1B5E20;
+    --sidebar-text: #FFFFFF;
+    --bg-light: #F5F5F5;
+    --text-dark: #212121;
+    --text-light: #757575;
+    --white: #FFFFFF;
+    --border-color: #E0E0E0;
+    --success-green: #66BB6A;
+    --error-red: #D32F2F;
+    --warning-orange: #F57C00;
+    --shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+    --shadow-lg: 0 4px 8px rgba(0, 0, 0, 0.15);
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    background: var(--bg-light);
+    color: var(--text-dark);
+}
+
+/* Login Page */
+.login-container {
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: linear-gradient(135deg, var(--primary-green) 0%, var(--dark-green) 100%);
+}
+
+.login-box {
+    background: var(--white);
+    padding: 3rem;
+    border-radius: 12px;
+    box-shadow: var(--shadow-lg);
+    width: 100%;
+    max-width: 400px;
+}
+
+.login-box .logo {
+    text-align: center;
+    margin-bottom: 2rem;
+}
+
+.login-box .logo img {
+    height: 60px;
+    margin-bottom: 1rem;
+}
+
+.login-box .logo h1 {
+    color: var(--primary-green);
+    font-size: 1.5rem;
+}
+
+.form-group {
+    margin-bottom: 1.5rem;
+}
+
+.form-group label {
+    display: block;
+    font-weight: 600;
+    margin-bottom: 0.5rem;
+    color: var(--text-dark);
+}
+
+.form-group input,
+.form-group select {
+    width: 100%;
+    padding: 0.75rem;
+    border: 2px solid var(--border-color);
+    border-radius: 6px;
+    font-size: 1rem;
+    transition: border-color 0.3s ease;
+}
+
+.form-group input:focus,
+.form-group select:focus {
+    outline: none;
+    border-color: var(--primary-green);
+}
+
+.login-btn {
+    width: 100%;
+    background: var(--primary-green);
+    color: var(--white);
+    border: none;
+    padding: 0.75rem;
+    border-radius: 6px;
+    font-size: 1rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.3s ease;
+}
+
+.login-btn:hover {
+    background: var(--dark-green);
+}
+
+.error-message {
+    color: var(--error-red);
+    margin-top: 1rem;
+    text-align: center;
+}
+
+/* Dashboard Layout */
+.dashboard-container {
+    display: flex;
+    min-height: 100vh;
+}
+
+/* Sidebar */
+.sidebar {
+    width: 260px;
+    background: var(--sidebar-bg);
+    color: var(--sidebar-text);
+    display: flex;
+    flex-direction: column;
+    position: fixed;
+    height: 100vh;
+    overflow-y: auto;
+}
+
+.sidebar-header {
+    padding: 2rem 1.5rem;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.sidebar-header h2 {
+    font-size: 1.3rem;
+    margin-bottom: 0.25rem;
+}
+
+.sidebar-header p {
+    font-size: 0.85rem;
+    opacity: 0.8;
+}
+
+.sidebar-nav {
+    flex: 1;
+    padding: 1rem 0;
+}
+
+.nav-item {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.75rem 1.5rem;
+    color: var(--sidebar-text);
+    text-decoration: none;
+    transition: background 0.3s ease;
+}
+
+.nav-item:hover {
+    background: rgba(255, 255, 255, 0.1);
+}
+
+.nav-item.active {
+    background: rgba(255, 255, 255, 0.2);
+    border-left: 4px solid var(--white);
+}
+
+.nav-icon {
+    font-size: 1.2rem;
+}
+
+.sidebar-footer {
+    padding: 1.5rem;
+    border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.user-info {
+    display: block;
+    margin-bottom: 1rem;
+}
+
+.user-info span {
+    display: block;
+}
+
+.role-badge {
+    background: rgba(255, 255, 255, 0.2);
+    padding: 0.25rem 0.5rem;
+    border-radius: 4px;
+    font-size: 0.75rem;
+    margin-top: 0.25rem;
+    display: inline-block;
+}
+
+.logout-btn {
+    width: 100%;
+    background: rgba(255, 255, 255, 0.1);
+    color: var(--white);
+    border: 1px solid rgba(255, 255, 255, 0.3);
+    padding: 0.5rem;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background 0.3s ease;
+}
+
+.logout-btn:hover {
+    background: rgba(255, 255, 255, 0.2);
+}
+
+/* Main Content */
+.main-content {
+    margin-left: 260px;
+    flex: 1;
+    padding: 2rem;
+    background: var(--bg-light);
+}
+
+.page {
+    display: none;
+}
+
+.page.active {
+    display: block;
+}
+
+.page-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 2rem;
+}
+
+.page-header h1 {
+    color: var(--dark-green);
+    font-size: 1.8rem;
+}
+
+.add-btn {
+    background: var(--primary-green);
+    color: var(--white);
+    border: none;
+    padding: 0.75rem 1.5rem;
+    border-radius: 6px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.3s ease;
+}
+
+.add-btn:hover {
+    background: var(--dark-green);
+}
+
+/* Stats Grid */
+.stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 1.5rem;
+    margin-bottom: 2rem;
+}
+
+.stat-card {
+    background: var(--white);
+    padding: 1.5rem;
+    border-radius: 12px;
+    box-shadow: var(--shadow);
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+}
+
+.stat-icon {
+    font-size: 2.5rem;
+}
+
+.stat-info h3 {
+    font-size: 2rem;
+    color: var(--primary-green);
+    margin-bottom: 0.25rem;
+}
+
+.stat-info p {
+    color: var(--text-light);
+    font-size: 0.9rem;
+}
+
+/* Tables */
+.table-container {
+    background: var(--white);
+    border-radius: 12px;
+    box-shadow: var(--shadow);
+    overflow-x: auto;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+thead {
+    background: var(--bg-light);
+}
+
+th, td {
+    padding: 1rem;
+    text-align: left;
+    border-bottom: 1px solid var(--border-color);
+}
+
+th {
+    font-weight: 600;
+    color: var(--text-dark);
+    font-size: 0.85rem;
+    text-transform: uppercase;
+}
+
+td {
+    color: var(--text-dark);
+}
+
+tr:hover {
+    background: rgba(46, 125, 50, 0.05);
+}
+
+.status-badge {
+    padding: 0.25rem 0.75rem;
+    border-radius: 20px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+}
+
+.status-badge.valid {
+    background: #E8F5E9;
+    color: var(--success-green);
+}
+
+.status-badge.expired {
+    background: #FFF3E0;
+    color: var(--warning-orange);
+}
+
+.status-badge.revoked {
+    background: #FFEBEE;
+    color: var(--error-red);
+}
+
+.action-btn {
+    padding: 0.4rem 0.8rem;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.8rem;
+    margin-right: 0.5rem;
+    transition: opacity 0.3s ease;
+}
+
+.action-btn:hover {
+    opacity: 0.8;
+}
+
+.edit-btn {
+    background: var(--primary-green);
+    color: var(--white);
+}
+
+.revoke-btn {
+    background: var(--warning-orange);
+    color: var(--white);
+}
+
+.delete-btn {
+    background: var(--error-red);
+    color: var(--white);
+}
+
+/* Filters */
+.filters {
+    display: flex;
+    gap: 1rem;
+    margin-bottom: 1.5rem;
+}
+
+.search-input,
+.filter-select {
+    padding: 0.75rem;
+    border: 2px solid var(--border-color);
+    border-radius: 6px;
+    font-size: 1rem;
+}
+
+.search-input {
+    flex: 1;
+}
+
+.search-input:focus,
+.filter-select:focus {
+    outline: none;
+    border-color: var(--primary-green);
+}
+
+/* Form */
+.document-form {
+    background: var(--white);
+    padding: 2rem;
+    border-radius: 12px;
+    box-shadow: var(--shadow);
+}
+
+.form-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 1.5rem;
+    margin-bottom: 1.5rem;
+}
+
+.form-actions {
+    display: flex;
+    gap: 1rem;
+    margin-top: 2rem;
+}
+
+.submit-btn,
+.cancel-btn {
+    padding: 0.75rem 2rem;
+    border-radius: 6px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.3s ease;
+}
+
+.submit-btn {
+    background: var(--primary-green);
+    color: var(--white);
+    border: none;
+}
+
+.submit-btn:hover {
+    background: var(--dark-green);
+}
+
+.cancel-btn {
+    background: var(--white);
+    color: var(--text-dark);
+    border: 2px solid var(--border-color);
+}
+
+.cancel-btn:hover {
+    background: var(--bg-light);
+}
+
+/* Modal */
+.modal {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0, 0, 0, 0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+}
+
+.modal-content {
+    background: var(--white);
+    border-radius: 12px;
+    width: 100%;
+    max-width: 600px;
+    max-height: 90vh;
+    overflow-y: auto;
+    box-shadow: var(--shadow-lg);
+}
+
+.modal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 1.5rem 2rem;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.modal-header h2 {
+    color: var(--dark-green);
+}
+
+.close-modal {
+    background: none;
+    border: none;
+    font-size: 2rem;
+    cursor: pointer;
+    color: var(--text-light);
+    transition: color 0.3s ease;
+}
+
+.close-modal:hover {
+    color: var(--text-dark);
+}
+
+.modal-body {
+    padding: 2rem;
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+    .sidebar {
+        width: 100%;
+        height: auto;
+        position: relative;
+    }
+    
+    .main-content {
+        margin-left: 0;
+    }
+    
+    .stats-grid {
+        grid-template-columns: 1fr;
+    }
+    
+    .table-container {
+        overflow-x: auto;
+    }
+    
+    table {
+        min-width: 800px;
+    }
+}
+
+/* Utility */
+.hidden {
+    display: none !important;
+}
+
+.loading {
+    text-align: center;
+    padding: 2rem;
+    color: var(--text-light);
+}
+
+.success-message {
+    background: #E8F5E9;
+    color: var(--success-green);
+    padding: 1rem;
+    border-radius: 6px;
+    margin-bottom: 1rem;
+}
+
+.error-message-alert {
+    background: #FFEBEE;
+    color: var(--error-red);
+    padding: 1rem;
+    border-radius: 6px;
+    margin-bottom: 1rem;
+}
+// admin/js/admin.js - Admin dashboard functionality
+let authToken = null;
+let currentUser = null;
+
+document.addEventListener('DOMContentLoaded', function() {
+    // Check for existing session
+    const storedToken = localStorage.getItem('adminToken');
+    if (storedToken) {
+        authToken = storedToken;
+        loadDashboard();
+    }
+    
+    // Login form handler
+    document.getElementById('loginForm')?.addEventListener('submit', handleLogin);
+    
+    // Logout handler
+    document.getElementById('logoutBtn')?.addEventListener('click', handleLogout);
+    
+    // Navigation handlers
+    document.querySelectorAll('.nav-item').forEach(item => {
+        item.addEventListener('click', function(e) {
+            e.preventDefault();
+            const page = this.dataset.page;
+            showPage(page);
+        });
+    });
+    
+    // Add document form
+    document.getElementById('addDocumentForm')?.addEventListener('submit', handleAddDocument);
+    
+    // Search and filter handlers
+    document.getElementById('searchInput')?.addEventListener('input', debounce(loadDocuments, 500));
+    document.getElementById('statusFilter')?.addEventListener('change', loadDocuments);
+    
+    // History search
+    document.getElementById('historySearch')?.addEventListener('input', debounce(loadHistory, 500));
+});
+
+async function handleLogin(e) {
+    e.preventDefault();
+    
+    const username = document.getElementById('username').value;
+    const password = document.getElementById('password').value;
+    const errorEl = document.getElementById('loginError');
+    
+    try {
+        const response = await fetch('/api/admin/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username, password })
+        });
+        
+        const data = await response.json();
+        
+        if (!data.success) {
+            errorEl.textContent = data.message || 'Login failed';
+            errorEl.style.display = 'block';
+            return;
+        }
+        
+        authToken = data.token;
+        currentUser = data.user;
+        localStorage.setItem('adminToken', authToken);
+        
+        document.getElementById('loginPage').style.display = 'none';
+        document.getElementById('dashboardPage').style.display = 'flex';
+        
+        loadDashboard();
+        
+    } catch (error) {
+        console.error('Login error:', error);
+        errorEl.textContent = 'Network error. Please try again.';
+        errorEl.style.display = 'block';
+    }
+}
+
+function handleLogout() {
+    authToken = null;
+    currentUser = null;
+    localStorage.removeItem('adminToken');
+    document.getElementById('dashboardPage').style.display = 'none';
+    document.getElementById('loginPage').style.display = 'flex';
+    document.getElementById('loginForm').reset();
+}
+
+async function loadDashboard() {
+    document.getElementById('loginPage').style.display = 'none';
+    document.getElementById('dashboardPage').style.display = 'flex';
+    
+    if (currentUser) {
+        document.getElementById('userFullName').textContent = currentUser.fullName;
+        document.getElementById('userRole').textContent = currentUser.role;
+    }
+    
+    loadAnalytics();
+    loadDocuments();
+    loadHistory();
+    showPage('overview');
+}
+
+async function loadAnalytics() {
+    try {
+        const response = await fetch('/api/documents/analytics', {
+            headers: { 'Authorization': `Bearer ${authToken}` }
+        });
+        
+        const data = await response.json();
+        
+        if (data.success) {
+            const { analytics } = data;
+            document.getElementById('totalDocuments').textContent = analytics.totalDocuments;
+            document.getElementById('totalVerifications').textContent = analytics.totalVerifications;
+            document.getElementById('invalidAttempts').textContent = analytics.invalidAttempts;
+            
+            const successRate = analytics.totalVerifications > 0
+                ? Math.round(((analytics.totalVerifications - analytics.invalidAttempts) / analytics.totalVerifications) * 100)
+                : 0;
+            document.getElementById('successRate').textContent = successRate + '%';
+            
+            // Populate recent verifications table
+            const tbody = document.querySelector('#recentTable tbody');
+            tbody.innerHTML = analytics.recentVerifications.slice(0, 10).map(log => `
+                <tr>
+                    <td>${escapeHtml(log.reference_number)}</td>
+                    <td>${escapeHtml(log.document_type || 'N/A')}</td>
+                    <td><span class="status-badge ${log.verification_status}">${log.verification_status}</span></td>
+                    <td>${formatDate(log.verification_time)}</td>
+                </tr>
+            `).join('');
+        }
+    } catch (error) {
+        console.error('Analytics error:', error);
+    }
+}
+
+async function loadDocuments() {
+    const search = document.getElementById('searchInput')?.value || '';
+    const status = document.getElementById('statusFilter')?.value || '';
+    
+    try {
+        const params = new URLSearchParams();
+        if (search) params.append('search', search);
+        if (status) params.append('status', status);
+        
+        const response = await fetch(`/api/admin/documents?${params}`, {
+            headers: { 'Authorization': `Bearer ${authToken}` }
+        });
+        
+        const
+      
