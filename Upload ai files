@@ -1,320 +1,32 @@
--- documents.sql - Database schema for Green Transport & Logistics
+green-transport-verify/
+├── index.html              # Main verification page
+├── admin.html              # Admin dashboard
+├── css/
+│   ├── styles.css          # Main stylesheet
+│   └── admin.css           # Admin dashboard styles
+├── js/
+│   ├── script.js           # Main verification functionality
+│   ├── admin.js            # Admin dashboard functionality
+│   └── database.js         # Client-side database (demo)
+├── images/
+│   ├── logo.png            # Company logo
+│   └── qr-placeholder.png  # QR code placeholder
+├── assets/
+│   └── favicon.ico         # Site favicon
+├── README.md               # Setup and usage instructions
+├── SECURITY.md             # Security guidelines
+└── .gitignore              # Git ignore file
 
--- Documents table
-CREATE TABLE documents (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    reference_number VARCHAR(50) UNIQUE NOT NULL,
-    document_type VARCHAR(100) NOT NULL,
-    client_name VARCHAR(255),
-    issue_date DATE NOT NULL,
-    expiry_date DATE,
-    status VARCHAR(20) DEFAULT 'valid' CHECK(status IN ('valid', 'expired', 'revoked')),
-    revocation_reason TEXT,
-    notes TEXT,
-    qr_code_data TEXT,
-    created_by VARCHAR(100) NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    is_deleted BOOLEAN DEFAULT FALSE
-);
-
--- Verification logs table
-CREATE TABLE verification_logs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    document_id INTEGER,
-    reference_number VARCHAR(50) NOT NULL,
-    verification_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    ip_address VARCHAR(45),
-    user_agent TEXT,
-    browser_type VARCHAR(100),
-    device_type VARCHAR(50),
-    verification_status VARCHAR(20),
-    FOREIGN KEY (document_id) REFERENCES documents(id)
-);
-
--- Admin users table
-CREATE TABLE admin_users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username VARCHAR(100) UNIQUE NOT NULL,
-    password_hash VARCHAR(255) NOT NULL,
-    email VARCHAR(255) UNIQUE NOT NULL,
-    full_name VARCHAR(255) NOT NULL,
-    role VARCHAR(50) DEFAULT 'admin',
-    is_active BOOLEAN DEFAULT TRUE,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_login TIMESTAMP
-);
-
--- Rate limiting table
-CREATE TABLE rate_limits (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    identifier VARCHAR(255) NOT NULL,
-    request_count INTEGER DEFAULT 1,
-    first_request TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_request TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- Indexes for performance
-CREATE INDEX idx_documents_reference ON documents(reference_number);
-CREATE INDEX idx_documents_status ON documents(status);
-CREATE INDEX idx_verification_logs_doc_id ON verification_logs(document_id);
-CREATE INDEX idx_verification_logs_time ON verification_logs(verification_time);
-CREATE INDEX idx_rate_limits_identifier ON rate_limits(identifier);
-
-// server/app.js - Main application entry point
-const express = require('express');
-const cors = require('cors');
-const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
-const validator = require('validator');
-const path = require('path');
-const { initDatabase } = require('./utils/database');
-const documentRoutes = require('./routes/documents');
-const adminRoutes = require('./routes/admin');
-const { logVerification } = require('./middleware/logging');
-
-const app = express();
-const PORT = process.env.PORT || 3000;
-
-// Security middleware
-app.use(helmet({
-    contentSecurityPolicy: {
-        directives: {
-            defaultSrc: ["'self'"],
-            styleSrc: ["'self'", "'unsafe-inline'"],
-            scriptSrc: ["'self'"],
-            imgSrc: ["'self'", 'data:', 'https:']
-        }
-    }
-}));
-
-// CORS configuration
-app.use(cors({
-    origin: process.env.ALLOWED_ORIGINS?.split(',') || ['https://www.greenlogistics-ng.com'],
-    credentials: true
-}));
-
-// Rate limiting - 100 requests per 15 minutes per IP
-const limiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 100,
-    message: 'Too many requests from this IP, please try again later.',
-    standardHeaders: true
-});
-app.use('/api/', limiter);
-
-// Stricter rate limit for verification endpoint
-const verifyLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 30,
-    message: 'Too many verification attempts, please try again later.',
-    keyGenerator: (req) => req.ip + '-verify'
-});
-
-// Body parsing
-app.use(express.json({ limit: '10kb' }));
-app.use(express.urlencoded({ extended: true, limit: '10kb' }));
-
-// Input sanitization middleware
-app.use((req, res, next) => {
-    // Sanitize all string inputs
-    const sanitize = (obj) => {
-        if (typeof obj === 'string') {
-            return validator.escape(obj.trim());
-        }
-        if (Array.isArray(obj)) {
-            return obj.map(sanitize);
-        }
-        if (obj && typeof obj === 'object') {
-            Object.keys(obj).forEach(key => {
-                obj[key] = sanitize(obj[key]);
-            });
-        }
-        return obj;
-    };
-    
-    if (req.body) req.body = sanitize(req.body);
-    if (req.query) req.query = sanitize(req.query);
-    if (req.params) req.params = sanitize(req.params);
-    
-    next();
-});
-
-// Static files
-app.use(express.static(path.join(__dirname, '../public')));
-app.use('/admin', express.static(path.join(__dirname, '../admin')));
-
-// Routes
-app.use('/api/documents', verifyLimiter, logVerification, documentRoutes);
-app.use('/api/admin', adminRoutes);
-
-// Public verification page
-app.get('/verify', (req, res) => {
-    res.sendFile(path.join(__dirname, '../public/verify.html'));
-});
-
-// Verification with reference in URL
-app.get('/verify/:reference', (req, res) => {
-    res.sendFile(path.join(__dirname, '../public/verify.html'));
-});
-
-// Initialize database and start server
-initDatabase()
-    .then(() => {
-        app.listen(PORT, () => {
-            console.log(`Server running on port ${PORT}`);
-            console.log(`Verification page: https://www.greenlogistics-ng.com/verify`);
-            console.log(`Admin dashboard: https://www.greenlogistics-ng.com/admin`);
-        });
-    })
-    .catch(err => {
-        console.error('Database initialization failed:', err);
-        process.exit(1);
-    });
-
-module.exports = app;
-// server/routes/documents.js - Document verification API
-const express = require('express');
-const router = express.Router();
-const db = require('../utils/database');
-const { validateReference } = require('../utils/validators');
-
-// Verify document by reference number
-router.get('/verify/:reference?', async (req, res) => {
-    try {
-        const reference = req.params.reference || req.query.ref;
-        
-        if (!reference) {
-            return res.status(400).json({
-                success: false,
-                message: 'Document reference number required'
-            });
-        }
-        
-        // Validate reference format
-        const validation = validateReference(reference);
-        if (!validation.valid) {
-            return res.status(400).json({
-                success: false,
-                message: validation.message
-            });
-        }
-        
-        // Query database using parameterized query
-        const document = await db.get(`
-            SELECT 
-                id,
-                reference_number,
-                document_type,
-                client_name,
-                issue_date,
-                expiry_date,
-                status,
-                revocation_reason,
-                created_at,
-                last_modified
-            FROM documents
-            WHERE reference_number = ? AND is_deleted = 0
-        `, [reference]);
-        
-        if (!document) {
-            return res.status(404).json({
-                success: false,
-                message: 'Document not found',
-                verified: false
-            });
-        }
-        
-        // Check if expired
-        let status = document.status;
-        if (status === 'valid' && document.expiry_date) {
-            const expiryDate = new Date(document.expiry_date);
-            if (expiryDate < new Date()) {
-                status = 'expired';
-            }
-        }
-        
-        res.json({
-            success: true,
-            verified: true,
-            document: {
-                referenceNumber: document.reference_number,
-                documentType: document.document_type,
-                clientName: document.client_name,
-                issueDate: document.issue_date,
-                expiryDate: document.expiry_date,
-                status: status,
-                revocationReason: document.revocation_reason,
-                qrGeneratedOn: document.created_at,
-                lastUpdated: document.last_modified,
-                issuedBy: 'Green Transport & Logistics'
-            }
-        });
-        
-    } catch (error) {
-        console.error('Verification error:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Verification service temporarily unavailable'
-        });
-    }
-});
-
-// Get document analytics (admin only)
-router.get('/analytics', async (req, res) => {
-    try {
-        const [
-            totalDocuments,
-            totalVerifications,
-            invalidAttempts,
-            recentVerifications
-        ] = await Promise.all([
-            db.get(`SELECT COUNT(*) as count FROM documents WHERE is_deleted = 0`),
-            db.get(`SELECT COUNT(*) as count FROM verification_logs`),
-            db.get(`SELECT COUNT(*) as count FROM verification_logs WHERE verification_status = 'not_found'`),
-            db.all(`
-                SELECT 
-                    vl.reference_number,
-                    vl.verification_time,
-                    vl.verification_status,
-                    d.document_type
-                FROM verification_logs vl
-                LEFT JOIN documents d ON vl.document_id = d.id
-                ORDER BY vl.verification_time DESC
-                LIMIT 50
-            `)
-        ]);
-        
-        res.json({
-            success: true,
-            analytics: {
-                totalDocuments: totalDocuments.count,
-                totalVerifications: totalVerifications.count,
-                invalidAttempts: invalidAttempts.count,
-                recentVerifications: recentVerifications
-            }
-        });
-        
-    } catch (error) {
-        console.error('Analytics error:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Failed to retrieve analytics'
-        });
-    }
-});
-
-module.exports = router;
-
-<!-- public/verify.html - Public verification page -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="description" content="Verify the authenticity of Green Transport & Logistics documents">
+    <meta name="keywords" content="document verification, QR code, Green Transport, logistics, authentication">
     <title>Document Verification | Green Transport & Logistics</title>
-    <link rel="stylesheet" href="css/verify.css">
+    <link rel="stylesheet" href="css/styles.css">
+    <link rel="icon" type="image/x-icon" href="assets/favicon.ico">
 </head>
 <body>
     <div class="container">
@@ -338,6 +50,7 @@ module.exports = router;
                     placeholder="Example: GTL-QT-2026-00125"
                     maxlength="50"
                     autocomplete="off"
+                    aria-label="Document reference number"
                 >
                 <button id="verifyBtn" class="verify-btn">
                     <span class="btn-text">Verify Document</span>
@@ -347,7 +60,7 @@ module.exports = router;
         </section>
 
         <!-- Results Section -->
-        <section id="resultsSection" class="results-section" style="display:none;">
+        <section id="resultsSection" class="results-section" style="display:none;" aria-live="polite">
             <!-- Verified Result -->
             <div id="verifiedCard" class="result-card verified" style="display:none;">
                 <div class="status-icon">✅</div>
@@ -432,14 +145,281 @@ module.exports = router;
         <footer class="footer">
             <p>&copy; 2026 Green Transport & Logistics. All rights reserved.</p>
             <p class="security-note">🔒 Secure verification powered by encrypted document authentication</p>
+            <p class="demo-note" style="display:none;">⚠️ Demo Mode: Using client-side storage. Connect to backend API for production.</p>
         </footer>
     </div>
 
-    <script src="js/verify.js"></script>
+    <script src="js/database.js"></script>
+    <script src="js/script.js"></script>
 </body>
 </html>
 
-/* public/css/verify.css - Styling for verification page */
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin Dashboard | Green Transport & Logistics</title>
+    <link rel="stylesheet" href="css/admin.css">
+    <link rel="icon" type="image/x-icon" href="assets/favicon.ico">
+</head>
+<body>
+    <!-- Login Page -->
+    <div id="loginPage" class="login-container">
+        <div class="login-box">
+            <div class="logo">
+                <img src="images/logo.png" alt="Logo" onerror="this.style.display='none'">
+                <h1>Admin Dashboard</h1>
+            </div>
+            <form id="loginForm">
+                <div class="form-group">
+                    <label for="username">Username</label>
+                    <input type="text" id="username" required autocomplete="username">
+                </div>
+                <div class="form-group">
+                    <label for="password">Password</label>
+                    <input type="password" id="password" required autocomplete="current-password">
+                </div>
+                <button type="submit" class="login-btn">Login</button>
+                <p id="loginError" class="error-message" style="display:none;"></p>
+            </form>
+        </div>
+    </div>
+
+    <!-- Main Dashboard -->
+    <div id="dashboardPage" class="dashboard-container" style="display:none;">
+        <!-- Sidebar -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <h2>Green Transport</h2>
+                <p>Admin Dashboard</p>
+            </div>
+            <nav class="sidebar-nav">
+                <a href="#" class="nav-item active" data-page="overview">
+                    <span class="nav-icon">📊</span>
+                    Overview
+                </a>
+                <a href="#" class="nav-item" data-page="documents">
+                    <span class="nav-icon">📄</span>
+                    Documents
+                </a>
+                <a href="#" class="nav-item" data-page="add">
+                    <span class="nav-icon">➕</span>
+                    Add Document
+                </a>
+                <a href="#" class="nav-item" data-page="history">
+                    <span class="nav-icon">📜</span>
+                    Verification History
+                </a>
+            </nav>
+            <div class="sidebar-footer">
+                <div class="user-info">
+                    <span id="userFullName">Admin User</span>
+                    <span id="userRole" class="role-badge">Admin</span>
+                </div>
+                <button id="logoutBtn" class="logout-btn">Logout</button>
+            </div>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Overview Page -->
+            <div id="overviewPage" class="page active">
+                <header class="page-header">
+                    <h1>Dashboard Overview</h1>
+                </header>
+                
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-icon">📄</div>
+                        <div class="stat-info">
+                            <h3 id="totalDocuments">0</h3>
+                            <p>Total Documents</p>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon">✅</div>
+                        <div class="stat-info">
+                            <h3 id="totalVerifications">0</h3>
+                            <p>Total Verifications</p>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon">❌</div>
+                        <div class="stat-info">
+                            <h3 id="invalidAttempts">0</h3>
+                            <p>Invalid Attempts</p>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon">📈</div>
+                        <div class="stat-info">
+                            <h3 id="successRate">0%</h3>
+                            <p>Success Rate</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="recent-verifications">
+                    <h2>Recent Verifications</h2>
+                    <div class="table-container">
+                        <table id="recentTable">
+                            <thead>
+                                <tr>
+                                    <th>Reference</th>
+                                    <th>Type</th>
+                                    <th>Status</th>
+                                    <th>Time</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <!-- Dynamic content -->
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Documents Page -->
+            <div id="documentsPage" class="page">
+                <header class="page-header">
+                    <h1>Manage Documents</h1>
+                    <button class="add-btn" onclick="showPage('add')">+ Add Document</button>
+                </header>
+                
+                <div class="filters">
+                    <input type="text" id="searchInput" placeholder="Search documents..." class="search-input">
+                    <select id="statusFilter" class="filter-select">
+                        <option value="">All Statuses</option>
+                        <option value="valid">Valid</option>
+                        <option value="expired">Expired</option>
+                        <option value="revoked">Revoked</option>
+                    </select>
+                </div>
+
+                <div class="table-container">
+                    <table id="documentsTable">
+                        <thead>
+                            <tr>
+                                <th>Reference</th>
+                                <th>Type</th>
+                                <th>Client</th>
+                                <th>Issue Date</th>
+                                <th>Status</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <!-- Dynamic content -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Add Document Page -->
+            <div id="addPage" class="page">
+                <header class="page-header">
+                    <h1>Add New Document</h1>
+                </header>
+                
+                <form id="addDocumentForm" class="document-form">
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="refNumber">Reference Number *</label>
+                            <input type="text" id="refNumber" required placeholder="GTL-QT-2026-00125">
+                        </div>
+                        <div class="form-group">
+                            <label for="docType">Document Type *</label>
+                            <select id="docType" required>
+                                <option value="">Select type</option>
+                                <option value="Quotation">Quotation</option>
+                                <option value="Invoice">Invoice</option>
+                                <option value="Delivery Note">Delivery Note</option>
+                                <option value="Contract">Contract</option>
+                                <option value="Certificate">Certificate</option>
+                                <option value="Letter">Letter</option>
+                                <option value="Other">Other</option>
+                            </select>
+                        </div>
+                    </div>
+                    
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="clientName">Client Name</label>
+                            <input type="text" id="clientName" placeholder="Optional">
+                        </div>
+                        <div class="form-group">
+                            <label for="issueDate">Issue Date *</label>
+                            <input type="date" id="issueDate" required>
+                        </div>
+                    </div>
+                    
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="expiryDate">Expiry Date</label>
+                            <input type="date" id="expiryDate">
+                        </div>
+                        <div class="form-group">
+                            <label for="notes">Notes</label>
+                            <input type="text" id="notes" placeholder="Optional notes">
+                        </div>
+                    </div>
+                    
+                    <div class="form-actions">
+                        <button type="submit" class="submit-btn">Create Document</button>
+                        <button type="button" class="cancel-btn" onclick="showPage('documents')">Cancel</button>
+                    </div>
+                </form>
+            </div>
+
+            <!-- History Page -->
+            <div id="historyPage" class="page">
+                <header class="page-header">
+                    <h1>Verification History</h1>
+                </header>
+                
+                <div class="filters">
+                    <input type="text" id="historySearch" placeholder="Search history..." class="search-input">
+                </div>
+
+                <div class="table-container">
+                    <table id="historyTable">
+                        <thead>
+                            <tr>
+                                <th>Reference</th>
+                                <th>Type</th>
+                                <th>Client</th>
+                                <th>Status</th>
+                                <th>Time</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <!-- Dynamic content -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Modal for Edit/Revoke -->
+    <div id="documentModal" class="modal" style="display:none;">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 id="modalTitle">Edit Document</h2>
+                <button class="close-modal" onclick="closeModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <!-- Dynamic content -->
+            </div>
+        </div>
+    </div>
+
+    <script src="js/database.js"></script>
+    <script src="js/admin.js"></script>
+</body>
+</html>
+
 :root {
     --primary-green: #2E7D32;
     --dark-green: #1B5E20;
@@ -762,6 +742,15 @@ body {
     color: var(--primary-green);
 }
 
+.demo-note {
+    background: #FFF3E0;
+    padding: 0.75rem;
+    border-radius: 6px;
+    margin-top: 1rem;
+    color: var(--warning-orange);
+    font-weight: 600;
+}
+
 /* Mobile Responsive */
 @media (max-width: 600px) {
     .container {
@@ -839,460 +828,7 @@ button:focus {
         border: 3px solid var(--text-dark);
     }
 }
-// public/js/verify.js - Client-side verification logic
-document.addEventListener('DOMContentLoaded', function() {
-    const referenceInput = document.getElementById('referenceInput');
-    const verifyBtn = document.getElementById('verifyBtn');
-    const resultsSection = document.getElementById('resultsSection');
-    const btnText = verifyBtn.querySelector('.btn-text');
-    const btnLoader = verifyBtn.querySelector('.btn-loader');
-    
-    // Check URL for reference parameter
-    checkUrlForReference();
-    
-    // Verify button click handler
-    verifyBtn.addEventListener('click', verifyDocument);
-    
-    // Enter key handler
-    referenceInput.addEventListener('keypress', function(e) {
-        if (e.key === 'Enter') {
-            verifyDocument();
-        }
-    });
-    
-    // Input validation - only allow alphanumeric and hyphens
-    referenceInput.addEventListener('input', function(e) {
-        const value = e.target.value;
-        const sanitized = value.replace(/[^a-zA-Z0-9-]/g, '');
-        if (value !== sanitized) {
-            e.target.value = sanitized;
-        }
-    });
-    
-    function checkUrlForReference() {
-        const path = window.location.pathname;
-        const urlParams = new URLSearchParams(window.location.search);
-        
-        // Check path format: /verify/GTL-QT-2026-00125
-        const pathParts = path.split('/');
-        if (pathParts.length >= 3 && pathParts[2]) {
-            const refFromPath = decodeURIComponent(pathParts[2]);
-            if (isValidReferenceFormat(refFromPath)) {
-                referenceInput.value = refFromPath;
-                verifyDocument();
-                return;
-            }
-        }
-        
-        // Check query parameter: /verify?ref=GTL-QT-2026-00125
-        const refFromQuery = urlParams.get('ref');
-        if (refFromQuery && isValidReferenceFormat(refFromQuery)) {
-            referenceInput.value = refFromQuery;
-            verifyDocument();
-            return;
-        }
-    }
-    
-    function isValidReferenceFormat(ref) {
-        // Basic validation: GTL-XX-YYYY-NNNNN format
-        const pattern = /^GTL-[A-Z]{2}-\d{4}-\d{5,}$/i;
-        return pattern.test(ref);
-    }
-    
-    async function verifyDocument() {
-        const reference = referenceInput.value.trim();
-        
-        if (!reference) {
-            showError('Please enter a document reference number');
-            return;
-        }
-        
-        // Basic format validation
-        if (!isValidReferenceFormat(reference)) {
-            showError('Invalid reference format. Expected: GTL-XX-YYYY-NNNNN');
-            return;
-        }
-        
-        // Disable button and show loading
-        setLoading(true);
-        hideResults();
-        
-        try {
-            const response = await fetch(`/api/documents/verify/${encodeURIComponent(reference)}`, {
-                method: 'GET',
-                headers: {
-                    'Content-Type': 'application/json'
-                }
-            });
-            
-            const data = await response.json();
-            
-            if (!data.success) {
-                if (response.status === 404) {
-                    showInvalid();
-                } else {
-                    showError(data.message || 'Verification failed');
-                }
-                return;
-            }
-            
-            displayVerificationResult(data.document);
-            
-        } catch (error) {
-            console.error('Verification error:', error);
-            showError('Network error. Please check your connection and try again.');
-        } finally {
-            setLoading(false);
-        }
-    }
-    
-    function displayVerificationResult(doc) {
-        hideResults();
-        
-        if (doc.status === 'revoked') {
-            showRevoked(doc.revocationReason);
-            return;
-        }
-        
-        // Populate verified card
-        document.getElementById('docType').textContent = doc.documentType;
-        document.getElementById('docRef').textContent = doc.referenceNumber;
-        document.getElementById('docIssue').textContent = formatDate(doc.issueDate);
-        document.getElementById('docExpiry').textContent = doc.expiryDate ? formatDate(doc.expiryDate) : 'N/A';
-        document.getElementById('docIssuedBy').textContent = doc.issuedBy;
-        document.getElementById('docClient').textContent = doc.clientName || 'Confidential';
-        
-        const statusElement = document.getElementById('docStatus');
-        statusElement.textContent = doc.status;
-        statusElement.className = 'status-badge ' + doc.status;
-        
-        document.getElementById('docQrDate').textContent = formatDate(doc.qrGeneratedOn);
-        document.getElementById('docUpdated').textContent = formatDate(doc.lastUpdated);
-        
-        document.getElementById('verifiedCard').style.display = 'block';
-        resultsSection.style.display = 'block';
-    }
-    
-    function showInvalid() {
-        hideResults();
-        document.getElementById('invalidCard').style.display = 'block';
-        resultsSection.style.display = 'block';
-    }
-    
-    function showRevoked(reason) {
-        hideResults();
-        document.getElementById('revocationReason').textContent = reason || 'No reason provided';
-        document.getElementById('revokedCard').style.display = 'block';
-        resultsSection.style.display = 'block';
-    }
-    
-    function showError(message) {
-        hideResults();
-        document.getElementById('errorMessage').textContent = message;
-        document.getElementById('errorCard').style.display = 'block';
-        resultsSection.style.display = 'block';
-    }
-    
-    function hideResults() {
-        resultsSection.style.display = 'none';
-        document.getElementById('verifiedCard').style.display = 'none';
-        document.getElementById('revokedCard').style.display = 'none';
-        document.getElementById('invalidCard').style.display = 'none';
-        document.getElementById('errorCard').style.display = 'none';
-    }
-    
-    function setLoading(loading) {
-        verifyBtn.disabled = loading;
-        btnText.style.display = loading ? 'none' : 'inline';
-        btnLoader.style.display = loading ? 'inline' : 'none';
-    }
-    
-    function formatDate(dateString) {
-        if (!dateString) return 'N/A';
-        const date = new Date(dateString);
-        return date.toLocaleDateString('en-NG', {
-            year: 'numeric',
-            month: 'long',
-            day: 'numeric'
-        });
-    }
-    
-    // Expose reset function globally
-    window.resetSearch = function() {
-        referenceInput.value = '';
-        hideResults();
-        referenceInput.focus();
-    };
-});
 
-<!-- admin/index.html - Admin dashboard -->
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Admin Dashboard | Green Transport & Logistics</title>
-    <link rel="stylesheet" href="css/admin.css">
-</head>
-<body>
-    <!-- Login Page -->
-    <div id="loginPage" class="login-container">
-        <div class="login-box">
-            <div class="logo">
-                <img src="../images/logo.png" alt="Logo" onerror="this.style.display='none'">
-                <h1>Admin Dashboard</h1>
-            </div>
-            <form id="loginForm">
-                <div class="form-group">
-                    <label for="username">Username</label>
-                    <input type="text" id="username" required autocomplete="username">
-                </div>
-                <div class="form-group">
-                    <label for="password">Password</label>
-                    <input type="password" id="password" required autocomplete="current-password">
-                </div>
-                <button type="submit" class="login-btn">Login</button>
-                <p id="loginError" class="error-message" style="display:none;"></p>
-            </form>
-        </div>
-    </div>
-
-    <!-- Main Dashboard -->
-    <div id="dashboardPage" class="dashboard-container" style="display:none;">
-        <!-- Sidebar -->
-        <aside class="sidebar">
-            <div class="sidebar-header">
-                <h2>Green Transport</h2>
-                <p>Admin Dashboard</p>
-            </div>
-            <nav class="sidebar-nav">
-                <a href="#" class="nav-item active" data-page="overview">
-                    <span class="nav-icon">📊</span>
-                    Overview
-                </a>
-                <a href="#" class="nav-item" data-page="documents">
-                    <span class="nav-icon">📄</span>
-                    Documents
-                </a>
-                <a href="#" class="nav-item" data-page="add">
-                    <span class="nav-icon">➕</span>
-                    Add Document
-                </a>
-                <a href="#" class="nav-item" data-page="history">
-                    <span class="nav-icon">📜</span>
-                    Verification History
-                </a>
-            </nav>
-            <div class="sidebar-footer">
-                <div class="user-info">
-                    <span id="userFullName">Admin User</span>
-                    <span id="userRole" class="role-badge">Admin</span>
-                </div>
-                <button id="logoutBtn" class="logout-btn">Logout</button>
-            </div>
-        </aside>
-
-        <!-- Main Content -->
-        <main class="main-content">
-            <!-- Overview Page -->
-            <div id="overviewPage" class="page active">
-                <header class="page-header">
-                    <h1>Dashboard Overview</h1>
-                </header>
-                
-                <div class="stats-grid">
-                    <div class="stat-card">
-                        <div class="stat-icon">📄</div>
-                        <div class="stat-info">
-                            <h3 id="totalDocuments">0</h3>
-                            <p>Total Documents</p>
-                        </div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-icon">✅</div>
-                        <div class="stat-info">
-                            <h3 id="totalVerifications">0</h3>
-                            <p>Total Verifications</p>
-                        </div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-icon">❌</div>
-                        <div class="stat-info">
-                            <h3 id="invalidAttempts">0</h3>
-                            <p>Invalid Attempts</p>
-                        </div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-icon">📈</div>
-                        <div class="stat-info">
-                            <h3 id="successRate">0%</h3>
-                            <p>Success Rate</p>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="recent-verifications">
-                    <h2>Recent Verifications</h2>
-                    <div class="table-container">
-                        <table id="recentTable">
-                            <thead>
-                                <tr>
-                                    <th>Reference</th>
-                                    <th>Type</th>
-                                    <th>Status</th>
-                                    <th>Time</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                <!-- Dynamic content -->
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Documents Page -->
-            <div id="documentsPage" class="page">
-                <header class="page-header">
-                    <h1>Manage Documents</h1>
-                    <button class="add-btn" onclick="showPage('add')">+ Add Document</button>
-                </header>
-                
-                <div class="filters">
-                    <input type="text" id="searchInput" placeholder="Search documents..." class="search-input">
-                    <select id="statusFilter" class="filter-select">
-                        <option value="">All Statuses</option>
-                        <option value="valid">Valid</option>
-                        <option value="expired">Expired</option>
-                        <option value="revoked">Revoked</option>
-                    </select>
-                </div>
-
-                <div class="table-container">
-                    <table id="documentsTable">
-                        <thead>
-                            <tr>
-                                <th>Reference</th>
-                                <th>Type</th>
-                                <th>Client</th>
-                                <th>Issue Date</th>
-                                <th>Status</th>
-                                <th>Actions</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <!-- Dynamic content -->
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-
-            <!-- Add Document Page -->
-            <div id="addPage" class="page">
-                <header class="page-header">
-                    <h1>Add New Document</h1>
-                </header>
-                
-                <form id="addDocumentForm" class="document-form">
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label for="refNumber">Reference Number *</label>
-                            <input type="text" id="refNumber" required placeholder="GTL-QT-2026-00125">
-                        </div>
-                        <div class="form-group">
-                            <label for="docType">Document Type *</label>
-                            <select id="docType" required>
-                                <option value="">Select type</option>
-                                <option value="Quotation">Quotation</option>
-                                <option value="Invoice">Invoice</option>
-                                <option value="Delivery Note">Delivery Note</option>
-                                <option value="Contract">Contract</option>
-                                <option value="Certificate">Certificate</option>
-                                <option value="Letter">Letter</option>
-                                <option value="Other">Other</option>
-                            </select>
-                        </div>
-                    </div>
-                    
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label for="clientName">Client Name</label>
-                            <input type="text" id="clientName" placeholder="Optional">
-                        </div>
-                        <div class="form-group">
-                            <label for="issueDate">Issue Date *</label>
-                            <input type="date" id="issueDate" required>
-                        </div>
-                    </div>
-                    
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label for="expiryDate">Expiry Date</label>
-                            <input type="date" id="expiryDate">
-                        </div>
-                        <div class="form-group">
-                            <label for="notes">Notes</label>
-                            <input type="text" id="notes" placeholder="Optional notes">
-                        </div>
-                    </div>
-                    
-                    <div class="form-actions">
-                        <button type="submit" class="submit-btn">Create Document</button>
-                        <button type="button" class="cancel-btn" onclick="showPage('documents')">Cancel</button>
-                    </div>
-                </form>
-            </div>
-
-            <!-- History Page -->
-            <div id="historyPage" class="page">
-                <header class="page-header">
-                    <h1>Verification History</h1>
-                </header>
-                
-                <div class="filters">
-                    <input type="text" id="historySearch" placeholder="Search history..." class="search-input">
-                </div>
-
-                <div class="table-container">
-                    <table id="historyTable">
-                        <thead>
-                            <tr>
-                                <th>Reference</th>
-                                <th>Type</th>
-                                <th>Client</th>
-                                <th>Status</th>
-                                <th>IP Address</th>
-                                <th>Browser</th>
-                                <th>Time</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <!-- Dynamic content -->
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-        </main>
-    </div>
-
-    <!-- Modal for Edit/Revoke -->
-    <div id="documentModal" class="modal" style="display:none;">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h2 id="modalTitle">Edit Document</h2>
-                <button class="close-modal" onclick="closeModal()">&times;</button>
-            </div>
-            <div class="modal-body">
-                <!-- Dynamic content -->
-            </div>
-        </div>
-    </div>
-
-    <script src="js/admin.js"></script>
-</body>
-</html>
-
-/* admin/css/admin.css - Admin dashboard styling */
 :root {
     --primary-green: #2E7D32;
     --dark-green: #1B5E20;
@@ -1357,7 +893,8 @@ body {
 }
 
 .form-group {
-    margin-bottom: 1.5rem;
+   mb
+1.5rem;
 }
 
 .form-group label {
@@ -1850,15 +1387,462 @@ tr:hover {
     border-radius: 6px;
     margin-bottom: 1rem;
 }
-// admin/js/admin.js - Admin dashboard functionality
-let authToken = null;
+
+/**
+ * Client-Side Database for Document Verification System
+ * Uses localStorage for demo purposes
+ * For production: Replace with backend API calls
+ */
+
+const DB_KEYS = {
+    DOCUMENTS: 'gtl_documents',
+    VERIFICATION_LOGS: 'gtl_verification_logs',
+    USERS: 'gtl_admin_users'
+};
+
+// Initialize default admin user
+function initializeDefaultUser() {
+    const users = getUsers();
+    if (users.length === 0) {
+        const defaultUser = {
+            id: 1,
+            username: 'admin',
+            password: 'admin123', // Change this immediately
+            email: 'admin@greenlogistics-ng.com',
+            fullName: 'Admin User',
+            role: 'admin',
+            isActive: true,
+            createdAt: new Date().toISOString(),
+            lastLogin: null
+        };
+        users.push(defaultUser);
+        localStorage.setItem(DB_KEYS.USERS, JSON.stringify(users));
+        console.log('Default admin user created. Please change password immediately.');
+    }
+}
+
+// Documents Functions
+function getDocuments() {
+    const docs = localStorage.getItem(DB_KEYS.DOCUMENTS);
+    return docs ? JSON.parse(docs) : [];
+}
+
+function saveDocuments(documents) {
+    localStorage.setItem(DB_KEYS.DOCUMENTS, JSON.stringify(documents));
+}
+
+function addDocument(document) {
+    const documents = getDocuments();
+    const existing = documents.find(doc => doc.referenceNumber === document.referenceNumber);
+    
+    if (existing) {
+        throw new Error('Document reference number already exists');
+    }
+    
+    const newDoc = {
+        id: Date.now(),
+        ...document,
+        status: 'valid',
+        revocationReason: null,
+        qrCodeData: `https://www.greenlogistics-ng.com/verify/${document.referenceNumber}`,
+        createdAt: new Date().toISOString(),
+        lastModified: new Date().toISOString()
+    };
+    
+    documents.push(newDoc);
+    saveDocuments(documents);
+    return newDoc;
+}
+
+function updateDocument(id, updates) {
+    const documents = getDocuments();
+    const index = documents.findIndex(doc => doc.id === id);
+    
+    if (index === -1) {
+        throw new Error('Document not found');
+    }
+    
+    documents[index] = {
+        ...documents[index],
+        ...updates,
+        lastModified: new Date().toISOString()
+    };
+    
+    saveDocuments(documents);
+    return documents[index];
+}
+
+function deleteDocument(id) {
+    const documents = getDocuments();
+    const filtered = documents.filter(doc => doc.id !== id);
+    saveDocuments(filtered);
+}
+
+function getDocumentByReference(reference) {
+    const documents = getDocuments();
+    return documents.find(doc => doc.referenceNumber === reference);
+}
+
+// Verification Logs Functions
+function getVerificationLogs() {
+    const logs = localStorage.getItem(DB_KEYS.VERIFICATION_LOGS);
+    return logs ? JSON.parse(logs) : [];
+}
+
+function saveLogs(logs) {
+    localStorage.setItem(DB_KEYS.VERIFICATION_LOGS, JSON.stringify(logs));
+}
+
+function addVerificationLog(log) {
+    const logs = getVerificationLogs();
+    const newLog = {
+        id: Date.now(),
+        ...log,
+        timestamp: new Date().toISOString()
+    };
+    
+    logs.unshift(newLog); // Add to beginning
+    
+    // Keep only last 1000 logs
+    if (logs.length > 1000) {
+        logs.length = 1000;
+    }
+    
+    saveLogs(logs);
+    return newLog;
+}
+
+// Users Functions
+function getUsers() {
+    const users = localStorage.getItem(DB_KEYS.USERS);
+    return users ? JSON.parse(users) : [];
+}
+
+function saveUsers(users) {
+    localStorage.setItem(DB_KEYS.USERS, JSON.stringify(users));
+}
+
+function authenticateUser(username, password) {
+    const users = getUsers();
+    const user = users.find(u => u.username === username && u.password === password && u.isActive);
+    
+    if (user) {
+        user.lastLogin = new Date().toISOString();
+        saveUsers(users);
+        return { ...user, password: undefined }; // Don't return password
+    }
+    
+    return null;
+}
+
+// Analytics Functions
+function getAnalytics() {
+    const documents = getDocuments();
+    const logs = getVerificationLogs();
+    
+    const totalDocuments = documents.length;
+    const totalVerifications = logs.length;
+    const invalidAttempts = logs.filter(log => log.status === 'not_found').length;
+    const successRate = totalVerifications > 0 
+        ? Math.round(((totalVerifications - invalidAttempts) / totalVerifications) * 100) 
+        : 0;
+    
+    return {
+        totalDocuments,
+        totalVerifications,
+        invalidAttempts,
+        successRate,
+        recentVerifications: logs.slice(0, 50)
+    };
+}
+
+// Utility Functions
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+function formatDate(dateString) {
+    if (!dateString) return 'N/A';
+    const date = new Date(dateString);
+    return date.toLocaleDateString('en-NG', {
+        year: 'numeric',
+        month: 'long',
+        day: 'numeric'
+    });
+}
+
+// Initialize on load
+initializeDefaultUser();
+
+// Export for use in other scripts
+if (typeof window !== 'undefined') {
+    window.Database = {
+        getDocuments,
+        saveDocuments,
+        addDocument,
+        updateDocument,
+        deleteDocument,
+        getDocumentByReference,
+        getVerificationLogs,
+        addVerificationLog,
+        getUsers,
+        saveUsers,
+        authenticateUser,
+        getAnalytics,
+        escapeHtml,
+        formatDate
+    };
+}
+
+/**
+ * Document Verification System - Main Script
+ * For production: Replace localStorage calls with API calls
+ */
+
+document.addEventListener('DOMContentLoaded', function() {
+    const referenceInput = document.getElementById('referenceInput');
+    const verifyBtn = document.getElementById('verifyBtn');
+    const resultsSection = document.getElementById('resultsSection');
+    const btnText = verifyBtn.querySelector('.btn-text');
+    const btnLoader = verifyBtn.querySelector('.btn-loader');
+    
+    // Show demo mode notice
+    const demoNote = document.querySelector('.demo-note');
+    if (demoNote && !localStorage.getItem('gtl_documents')) {
+        demoNote.style.display = 'block';
+    }
+    
+    // Check URL for reference parameter
+    checkUrlForReference();
+    
+    // Verify button click handler
+    verifyBtn.addEventListener('click', verifyDocument);
+    
+    // Enter key handler
+    referenceInput.addEventListener('keypress', function(e) {
+        if (e.key === 'Enter') {
+            verifyDocument();
+        }
+    });
+    
+    // Input validation - only allow alphanumeric and hyphens
+    referenceInput.addEventListener('input', function(e) {
+        const value = e.target.value;
+        const sanitized = value.replace(/[^a-zA-Z0-9-]/g, '');
+        if (value !== sanitized) {
+            e.target.value = sanitized;
+        }
+    });
+    
+    function checkUrlForReference() {
+        const path = window.location.pathname;
+        const urlParams = new URLSearchParams(window.location.search);
+        
+        // Check path format: /verify/GTL-QT-2026-00125
+        const pathParts = path.split('/');
+        if (pathParts.length >= 2 && pathParts[pathParts.length - 1]) {
+            const refFromPath = decodeURIComponent(pathParts[pathParts.length - 1]);
+            if (isValidReferenceFormat(refFromPath)) {
+                referenceInput.value = refFromPath;
+                setTimeout(() => verifyDocument(), 500);
+                return;
+            }
+        }
+        
+        // Check query parameter: /verify?ref=GTL-QT-2026-00125
+        const refFromQuery = urlParams.get('ref');
+        if (refFromQuery && isValidReferenceFormat(refFromQuery)) {
+            referenceInput.value = refFromQuery;
+            setTimeout(() => verifyDocument(), 500);
+            return;
+        }
+    }
+    
+    function isValidReferenceFormat(ref) {
+        // Basic validation: GTL-XX-YYYY-NNNNN format
+        const pattern = /^GTL-[A-Z]{2}-\d{4}-\d{5,}$/i;
+        return pattern.test(ref);
+    }
+    
+    async function verifyDocument() {
+        const reference = referenceInput.value.trim();
+        
+        if (!reference) {
+            showError('Please enter a document reference number');
+            return;
+        }
+        
+        // Basic format validation
+        if (!isValidReferenceFormat(reference)) {
+            showError('Invalid reference format. Expected: GTL-XX-YYYY-NNNNN');
+            return;
+        }
+        
+        // Disable button and show loading
+        setLoading(true);
+        hideResults();
+        
+        try {
+            // Get document from database
+            const document = window.Database.getDocumentByReference(reference);
+            
+            if (!document) {
+                // Log verification attempt
+                window.Database.addVerificationLog({
+                    referenceNumber: reference,
+                    status: 'not_found',
+                    documentType: null,
+                    clientName: null,
+                    browserType: getBrowserType(),
+                    deviceType: getDeviceType()
+                });
+                
+                showInvalid();
+                return;
+            }
+            
+            // Check if expired
+            let status = document.status;
+            if (status === 'valid' && document.expiryDate) {
+                const expiryDate = new Date(document.expiryDate);
+                if (expiryDate < new Date()) {
+                    status = 'expired';
+                }
+            }
+            
+            // Log verification
+            window.Database.addVerificationLog({
+                referenceNumber: reference,
+                status: status,
+                documentType: document.documentType,
+                clientName: document.clientName,
+                browserType: getBrowserType(),
+                deviceType: getDeviceType()
+            });
+            
+            // Display result
+            displayVerificationResult({
+                ...document,
+                status: status
+            });
+            
+        } catch (error) {
+            console.error('Verification error:', error);
+            showError('Network error. Please check your connection and try again.');
+        } finally {
+            setLoading(false);
+        }
+    }
+    
+    function displayVerificationResult(doc) {
+        hideResults();
+        
+        if (doc.status === 'revoked') {
+            showRevoked(doc.revocationReason);
+            return;
+        }
+        
+        // Populate verified card
+        document.getElementById('docType').textContent = doc.documentType;
+        document.getElementById('docRef').textContent = doc.referenceNumber;
+        document.getElementById('docIssue').textContent = formatDate(doc.issueDate);
+        document.getElementById('docExpiry').textContent = doc.expiryDate ? formatDate(doc.expiryDate) : 'N/A';
+        document.getElementById('docIssuedBy').textContent = 'Green Transport & Logistics';
+        document.getElementById('docClient').textContent = doc.clientName || 'Confidential';
+        
+        const statusElement = document.getElementById('docStatus');
+        statusElement.textContent = doc.status;
+        statusElement.className = 'status-badge ' + doc.status;
+        
+        document.getElementById('docQrDate').textContent = formatDate(doc.createdAt);
+        document.getElementById('docUpdated').textContent = formatDate(doc.lastModified);
+        
+        document.getElementById('verifiedCard').style.display = 'block';
+        resultsSection.style.display = 'block';
+    }
+    
+    function showInvalid() {
+        hideResults();
+        document.getElementById('invalidCard').style.display = 'block';
+        resultsSection.style.display = 'block';
+    }
+    
+    function showRevoked(reason) {
+        hideResults();
+        document.getElementById('revocationReason').textContent = reason || 'No reason provided';
+        document.getElementById('revokedCard').style.display = 'block';
+        resultsSection.style.display = 'block';
+    }
+    
+    function showError(message) {
+        hideResults();
+        document.getElementById('errorMessage').textContent = message;
+        document.getElementById('errorCard').style.display = 'block';
+        resultsSection.style.display = 'block';
+    }
+    
+    function hideResults() {
+        resultsSection.style.display = 'none';
+        document.getElementById('verifiedCard').style.display = 'none';
+        document.getElementById('revokedCard').style.display = 'none';
+        document.getElementById('invalidCard').style.display = 'none';
+        document.getElementById('errorCard').style.display = 'none';
+    }
+    
+    function setLoading(loading) {
+        verifyBtn.disabled = loading;
+        btnText.style.display = loading ? 'none' : 'inline';
+        btnLoader.style.display = loading ? 'inline' : 'none';
+    }
+    
+    function formatDate(dateString) {
+        if (!dateString) return 'N/A';
+        const date = new Date(dateString);
+        return date.toLocaleDateString('en-NG', {
+            year: 'numeric',
+            month: 'long',
+            day: 'numeric'
+        });
+    }
+    
+    function getBrowserType() {
+        const userAgent = navigator.userAgent;
+        if (userAgent.includes('Chrome')) return 'Chrome';
+        if (userAgent.includes('Firefox')) return 'Firefox';
+        if (userAgent.includes('Safari')) return 'Safari';
+        if (userAgent.includes('Edge')) return 'Edge';
+        return 'Other';
+    }
+    
+    function getDeviceType() {
+        const userAgent = navigator.userAgent;
+        if (userAgent.includes('Mobile')) return 'Mobile';
+        if (userAgent.includes('Tablet')) return 'Tablet';
+        return 'Desktop';
+    }
+    
+    // Expose reset function globally
+    window.resetSearch = function() {
+        referenceInput.value = '';
+        hideResults();
+        referenceInput.focus();
+    };
+});
+
+/**
+ * Admin Dashboard Script
+ * For production: Replace localStorage calls with API calls
+ */
+
 let currentUser = null;
 
 document.addEventListener('DOMContentLoaded', function() {
     // Check for existing session
-    const storedToken = localStorage.getItem('adminToken');
-    if (storedToken) {
-        authToken = storedToken;
+    const storedUser = localStorage.getItem('gtl_currentUser');
+    if (storedUser) {
+        currentUser = JSON.parse(storedUser);
         loadDashboard();
     }
     
@@ -1896,23 +1880,16 @@ async function handleLogin(e) {
     const errorEl = document.getElementById('loginError');
     
     try {
-        const response = await fetch('/api/admin/login', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ username, password })
-        });
+        const user = window.Database.authenticateUser(username, password);
         
-        const data = await response.json();
-        
-        if (!data.success) {
-            errorEl.textContent = data.message || 'Login failed';
+        if (!user) {
+            errorEl.textContent = 'Invalid username or password';
             errorEl.style.display = 'block';
             return;
         }
         
-        authToken = data.token;
-        currentUser = data.user;
-        localStorage.setItem('adminToken', authToken);
+        currentUser = user;
+        localStorage.setItem('gtl_currentUser', JSON.stringify(user));
         
         document.getElementById('loginPage').style.display = 'none';
         document.getElementById('dashboardPage').style.display = 'flex';
@@ -1921,21 +1898,20 @@ async function handleLogin(e) {
         
     } catch (error) {
         console.error('Login error:', error);
-        errorEl.textContent = 'Network error. Please try again.';
+        errorEl.textContent = 'Login failed. Please try again.';
         errorEl.style.display = 'block';
     }
 }
 
 function handleLogout() {
-    authToken = null;
     currentUser = null;
-    localStorage.removeItem('adminToken');
+    localStorage.removeItem('gtl_currentUser');
     document.getElementById('dashboardPage').style.display = 'none';
     document.getElementById('loginPage').style.display = 'flex';
     document.getElementById('loginForm').reset();
 }
 
-async function loadDashboard() {
+function loadDashboard() {
     document.getElementById('loginPage').style.display = 'none';
     document.getElementById('dashboardPage').style.display = 'flex';
     
@@ -1950,53 +1926,226 @@ async function loadDashboard() {
     showPage('overview');
 }
 
-async function loadAnalytics() {
-    try {
-        const response = await fetch('/api/documents/analytics', {
-            headers: { 'Authorization': `Bearer ${authToken}` }
-        });
-        
-        const data = await response.json();
-        
-        if (data.success) {
-            const { analytics } = data;
-            document.getElementById('totalDocuments').textContent = analytics.totalDocuments;
-            document.getElementById('totalVerifications').textContent = analytics.totalVerifications;
-            document.getElementById('invalidAttempts').textContent = analytics.invalidAttempts;
-            
-            const successRate = analytics.totalVerifications > 0
-                ? Math.round(((analytics.totalVerifications - analytics.invalidAttempts) / analytics.totalVerifications) * 100)
-                : 0;
-            document.getElementById('successRate').textContent = successRate + '%';
-            
-            // Populate recent verifications table
-            const tbody = document.querySelector('#recentTable tbody');
-            tbody.innerHTML = analytics.recentVerifications.slice(0, 10).map(log => `
-                <tr>
-                    <td>${escapeHtml(log.reference_number)}</td>
-                    <td>${escapeHtml(log.document_type || 'N/A')}</td>
-                    <td><span class="status-badge ${log.verification_status}">${log.verification_status}</span></td>
-                    <td>${formatDate(log.verification_time)}</td>
-                </tr>
-            `).join('');
-        }
-    } catch (error) {
-        console.error('Analytics error:', error);
-    }
+function loadAnalytics() {
+    const analytics = window.Database.getAnalytics();
+    
+    document.getElementById('totalDocuments').textContent = analytics.totalDocuments;
+    document.getElementById('totalVerifications').textContent = analytics.totalVerifications;
+    document.getElementById('invalidAttempts').textContent = analytics.invalidAttempts;
+    document.getElementById('successRate').textContent = analytics.successRate + '%';
+    
+    // Populate recent verifications table
+    const tbody = document.querySelector('#recentTable tbody');
+    tbody.innerHTML = analytics.recentVerifications.slice(0, 10).map(log => `
+        <tr>
+            <td>${window.Database.escapeHtml(log.referenceNumber)}</td>
+            <td>${window.Database.escapeHtml(log.documentType || 'N/A')}</td>
+            <td><span class="status-badge ${log.status}">${log.status}</span></td>
+            <td>${window.Database.formatDate(log.timestamp)}</td>
+        </tr>
+    `).join('');
 }
 
-async function loadDocuments() {
+function loadDocuments() {
     const search = document.getElementById('searchInput')?.value || '';
     const status = document.getElementById('statusFilter')?.value || '';
     
+    let documents = window.Database.getDocuments();
+    
+    // Filter by search
+    if (search) {
+        const searchTerm = search.toLowerCase();
+        documents = documents.filter(doc => 
+            doc.referenceNumber.toLowerCase().includes(searchTerm) ||
+            (doc.clientName && doc.clientName.toLowerCase().includes(searchTerm)) ||
+            doc.documentType.toLowerCase().includes(searchTerm)
+        );
+    }
+    
+    // Filter by status
+    if (status) {
+        documents = documents.filter(doc => doc.status === status);
+    }
+    
+    // Populate table
+    const tbody = document.querySelector('#documentsTable tbody');
+    tbody.innerHTML = documents.map(doc => `
+        <tr>
+            <td>${window.Database.escapeHtml(doc.referenceNumber)}</td>
+            <td>${window.Database.escapeHtml(doc.documentType)}</td>
+            <td>${window.Database.escapeHtml(doc.clientName || 'N/A')}</td>
+            <td>${window.Database.formatDate(doc.issueDate)}</td>
+            <td><span class="status-badge ${doc.status}">${doc.status}</span></td>
+            <td>
+                <button class="action-btn edit-btn" onclick="editDocument(${doc.id})">Edit</button>
+                <button class="action-btn revoke-btn" onclick="revokeDocument(${doc.id})">Revoke</button>
+                <button class="action-btn delete-btn" onclick="deleteDocument(${doc.id})">Delete</button>
+            </td>
+        </tr>
+    `).join('');
+}
+
+function handleAddDocument(e) {
+    e.preventDefault();
+    
+    const document = {
+        referenceNumber: document.getElementById('refNumber').value.trim(),
+        documentType: document.getElementById('docType').value,
+        clientName: document.getElementById('clientName').value.trim() || null,
+        issueDate: document.getElementById('issueDate').value,
+        expiryDate: document.getElementById('expiryDate').value || null,
+        notes: document.getElementById('notes').value.trim() || null
+    };
+    
     try {
-        const params = new URLSearchParams();
-        if (search) params.append('search', search);
-        if (status) params.append('status', status);
+        window.Database.addDocument(document);
+        alert('Document created successfully!');
+        document.getElementById('addDocumentForm').reset();
+        showPage('documents');
+        loadDocuments();
+    } catch (error) {
+        alert('Error: ' + error.message);
+    }
+}
+
+function editDocument(id) {
+    const doc = window.Database.getDocuments().find(d => d.id === id);
+    if (!doc) return;
+    
+    const modal = document.getElementById('documentModal');
+    const modalBody = document.querySelector('.modal-body');
+    document.getElementById('modalTitle').textContent = 'Edit Document';
+    
+    modalBody.innerHTML = `
+        <form id="editForm">
+            <div class="form-group">
+                <label>Reference Number</label>
+                <input type="text" value="${window.Database.escapeHtml(doc.referenceNumber)}" readonly>
+            </div>
+            <div class="form-group">
+                <label>Document Type</label>
+                <select id="editDocType" required>
+                    <option value="Quotation" ${doc.documentType === 'Quotation' ? 'selected' : ''}>Quotation</option>
+                    <option value="Invoice" ${doc.documentType === 'Invoice' ? 'selected' : ''}>Invoice</option>
+                    <option value="Delivery Note" ${doc.documentType === 'Delivery Note' ? 'selected' : ''}>Delivery Note</option>
+                    <option value="Contract" ${doc.documentType === 'Contract' ? 'selected' : ''}>Contract</option>
+                    <option value="Certificate" ${doc.documentType === 'Certificate' ? 'selected' : ''}>Certificate</option>
+                    <option value="Letter" ${doc.documentType === 'Letter' ? 'selected' : ''}>Letter</option>
+                    <option value="Other" ${doc.documentType === 'Other' ? 'selected' : ''}>Other</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Client Name</label>
+                <input type="text" id="editClientName" value="${window.Database.escapeHtml(doc.clientName || '')}">
+            </div>
+            <div class="form-group">
+                <label>Issue Date</label>
+                <input type="date" id="editIssueDate" value="${doc.issueDate}" required>
+            </div>
+            <div class="form-group">
+                <label>Expiry Date</label>
+                <input type="date" id="editExpiryDate" value="${doc.expiryDate || ''}">
+            </div>
+            <div class="form-actions">
+                <button type="submit" class="submit-btn">Save Changes</button>
+                <button type="button" class="cancel-btn" onclick="closeModal()">Cancel</button>
+            </div>
+        </form>
+    `;
+    
+    document.getElementById('editForm').addEventListener('submit', function(e) {
+        e.preventDefault();
         
-        const response = await fetch(`/api/admin/documents?${params}`, {
-            headers: { 'Authorization': `Bearer ${authToken}` }
+        window.Database.updateDocument(id, {
+            documentType: document.getElementById('editDocType').value,
+            clientName: document.getElementById('editClientName').value.trim(),
+            issueDate: document.getElementById('editIssueDate').value,
+            expiryDate: document.getElementById('editExpiryDate').value || null
         });
         
-        const
-      
+        alert('Document updated successfully!');
+        closeModal();
+        loadDocuments();
+    });
+    
+    modal.style.display = 'flex';
+}
+
+function revokeDocument(id) {
+    const doc = window.Database.getDocuments().find(d => d.id === id);
+    if (!doc) return;
+    
+    const reason = prompt('Enter revocation reason:', 'Revoked by administrator');
+    if (reason === null) return;
+    
+    window.Database.updateDocument(id, {
+        status: 'revoked',
+        revocationReason: reason || 'No reason provided'
+    });
+    
+    alert('Document revoked successfully!');
+    loadDocuments();
+}
+
+function deleteDocument(id) {
+    if (!confirm('Are you sure you want to delete this document? This action cannot be undone.')) {
+        return;
+    }
+    
+    window.Database.deleteDocument(id);
+    alert('Document deleted successfully!');
+    loadDocuments();
+}
+
+function loadHistory() {
+    const search = document.getElementById('historySearch')?.value || '';
+    let logs = window.Database.getVerificationLogs();
+    
+    if (search) {
+        const searchTerm = search.toLowerCase();
+        logs = logs.filter(log => 
+            log.referenceNumber.toLowerCase().includes(searchTerm)
+        );
+    }
+    
+    const tbody = document.querySelector('#historyTable tbody');
+    tbody.innerHTML = logs.slice(0, 100).map(log => `
+        <tr>
+            <td>${window.Database.escapeHtml(log.referenceNumber)}</td>
+            <td>${window.Database.escapeHtml(log.documentType || 'Unknown')}</td>
+            <td>${window.Database.escapeHtml(log.clientName || 'N/A')}</td>
+            <td><span class="status-badge ${log.status}">${log.status}</span></td>
+            <td>${window.Database.escapeHtml(log.browserType || 'Unknown')}</td>
+            <td>${window.Database.formatDate(log.timestamp)}</td>
+        </tr>
+    `).join('');
+}
+
+function showPage(pageName) {
+    // Update nav items
+    document.querySelectorAll('.nav-item').forEach(item => {
+        item.classList.toggle('active', item.dataset.page === pageName);
+    });
+    
+    // Show/hide pages
+    document.querySelectorAll('.page').forEach(page => {
+        page.classList.toggle('active', page.id === pageName + 'Page');
+    });
+}
+
+function closeModal() {
+    document.getElementById('documentModal').style.display = 'none';
+}
+
+function debounce(func, wait) {
+    let timeout;
+    return function executedFunction(...args) {
+        const later = () => {
+            clearTimeout(timeout);
+            func(...args);
+        };
+        clearTimeout(timeout);
+        timeout = setTimeout(later, wait);
+    };
+}
+
